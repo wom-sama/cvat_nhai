@@ -48,6 +48,9 @@ py -m venv .venv
 
 ## Thao tac
 
+- `Thu muc dich`: chon mot thu muc goc. Tool tu tao
+  `<dich>\dataset` cho YOLO, `<dich>\cls_crops` cho classification va
+  `<dich>\.cvat_nhai_archive` cho hoan tac.
 - `1` den `5`: chon class.
 - Keo chuot trai: ve bbox.
 - Keo trong bbox: di chuyen.

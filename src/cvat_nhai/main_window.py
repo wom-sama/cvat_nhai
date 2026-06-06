@@ -39,7 +39,7 @@ from .dataset import DatasetError, DatasetManager
 from .migration import apply_migration, plan_migration
 from .models import BBox, DatasetPaths, MigrationReport
 from .scanner import scan_images
-from .schema import audit_schema
+from .schema import audit_schema, initialize_empty_datasets
 from .settings_dialog import SettingsDialog
 from .workers import FunctionTask
 
@@ -90,6 +90,10 @@ class MainWindow(QMainWindow):
         self.crop_padding = float(
             self.settings.value("datasets/crop_padding", 0.08)
         )
+        output_root_value = str(
+            self.settings.value("datasets/output_root", "")
+        ).strip()
+        self.output_root = Path(output_root_value) if output_root_value else None
         self.source_root = Path(
             self.settings.value("source/root", "")
         ) if self.settings.value("source/root", "") else None
@@ -102,6 +106,7 @@ class MainWindow(QMainWindow):
         self.busy = False
         self.image_cache: "OrderedDict[str, QImage]" = OrderedDict()
         self.pending_loads = set()
+        self.active_tasks = set()
         self.class_buttons: List[QPushButton] = []
 
         self._build_ui()
@@ -161,6 +166,32 @@ class MainWindow(QMainWindow):
         self.scan_button = QPushButton("Quet anh")
         self.scan_button.clicked.connect(self.scan_source)
         side.addWidget(self.scan_button)
+
+        destination_label = QLabel("THU MUC DICH")
+        destination_label.setObjectName("sectionLabel")
+        side.addWidget(destination_label)
+        destination_row = QHBoxLayout()
+        self.destination_edit = QLineEdit()
+        self.destination_edit.setPlaceholderText(
+            "Tao dataset/ va cls_crops/ trong thu muc nay"
+        )
+        if self.output_root is not None:
+            self.destination_edit.setText(str(self.output_root))
+        self.destination_edit.returnPressed.connect(
+            self.apply_destination_from_text
+        )
+        destination_browse = QToolButton()
+        destination_browse.setText("...")
+        destination_browse.setToolTip("Chon thu muc dich")
+        destination_browse.clicked.connect(self.choose_destination)
+        destination_row.addWidget(self.destination_edit)
+        destination_row.addWidget(destination_browse)
+        side.addLayout(destination_row)
+        self.destination_hint = QLabel(
+            "Tao: dataset (YOLO) + cls_crops (classification)"
+        )
+        self.destination_hint.setObjectName("muted")
+        side.addWidget(self.destination_hint)
 
         progress_row = QHBoxLayout()
         self.queue_label = QLabel("0 anh")
@@ -382,6 +413,61 @@ class MainWindow(QMainWindow):
             self.source_edit.setText(folder)
             self.scan_source()
 
+    def choose_destination(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Chon thu muc dich",
+            self.destination_edit.text() or str(Path.home()),
+        )
+        if folder:
+            self.destination_edit.setText(folder)
+            self.apply_destination_from_text()
+
+    def apply_destination_from_text(self) -> None:
+        text = self.destination_edit.text().strip()
+        if not text:
+            self.statusBar().showMessage("Chon thu muc dich", 3000)
+            return
+        try:
+            self.set_destination_root(Path(text))
+        except Exception as error:
+            self._show_error(str(error))
+
+    def set_destination_root(self, root: Path) -> None:
+        root = root.expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        detection_root = root / "dataset"
+        classification_root = root / "cls_crops"
+        archive_root = root / ".cvat_nhai_archive"
+        initialize_empty_datasets(detection_root, classification_root)
+
+        self.output_root = root
+        self.detection_root = detection_root
+        self.classification_root = classification_root
+        self.archive_root = archive_root
+        self.destination_edit.setText(str(root))
+        self.settings.setValue("datasets/output_root", str(root))
+        self.settings.setValue(
+            "datasets/detection_root",
+            str(self.detection_root),
+        )
+        self.settings.setValue(
+            "datasets/classification_root",
+            str(self.classification_root),
+        )
+        self.settings.setValue(
+            "datasets/archive_root",
+            str(self.archive_root),
+        )
+        self.manager = self._make_manager()
+        self._update_schema_status()
+        self.statusBar().showMessage(
+            "Da chon dich: {} (dataset + cls_crops)".format(root),
+            5000,
+        )
+        if self.source_root and self.source_root.is_dir():
+            self.scan_source()
+
     def scan_source(self) -> None:
         text = self.source_edit.text().strip()
         if not text:
@@ -411,6 +497,14 @@ class MainWindow(QMainWindow):
                 self.scan_button.setEnabled(True),
                 self.scan_button.setText("Quet anh"),
             )
+        )
+        self._start_task(task)
+
+    def _start_task(self, task: FunctionTask) -> None:
+        """Keep the Python QRunnable wrapper alive until queued signals finish."""
+        self.active_tasks.add(task)
+        task.signals.finished.connect(
+            lambda value=task: self.active_tasks.discard(value)
         )
         self.thread_pool.start(task)
 
@@ -484,7 +578,7 @@ class MainWindow(QMainWindow):
         task.signals.finished.connect(
             lambda value=key: self.pending_loads.discard(value)
         )
-        self.thread_pool.start(task)
+        self._start_task(task)
 
     def _image_loaded(self, path: Path, result: object, display: bool) -> None:
         image = result
@@ -568,7 +662,7 @@ class MainWindow(QMainWindow):
         )
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(lambda: self._set_busy(False))
-        self.thread_pool.start(task)
+        self._start_task(task)
 
     def delete_current(self) -> None:
         if self.busy or self.current_path is None:
@@ -581,7 +675,7 @@ class MainWindow(QMainWindow):
         )
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(lambda: self._set_busy(False))
-        self.thread_pool.start(task)
+        self._start_task(task)
 
     def _operation_finished(self, path: Path, result: object) -> None:
         if path in self.images:
@@ -613,7 +707,7 @@ class MainWindow(QMainWindow):
         task.signals.succeeded.connect(self._undo_finished)
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(lambda: self._set_busy(False))
-        self.thread_pool.start(task)
+        self._start_task(task)
 
     def _undo_finished(self, result: object) -> None:
         if isinstance(result, Path):
@@ -689,7 +783,7 @@ class MainWindow(QMainWindow):
         task.signals.succeeded.connect(self._migration_finished)
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(lambda: self._set_busy(False))
-        self.thread_pool.start(task)
+        self._start_task(task)
 
     def _migration_finished(self, result: object) -> None:
         if not isinstance(result, MigrationReport):
@@ -737,6 +831,9 @@ class MainWindow(QMainWindow):
             "datasets/crop_padding",
             self.crop_padding,
         )
+        self.output_root = None
+        self.settings.setValue("datasets/output_root", "")
+        self.destination_edit.clear()
         self.manager = self._make_manager()
         self._update_schema_status()
 

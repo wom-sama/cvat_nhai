@@ -4,6 +4,7 @@ from typing import Dict
 from .constants import CLASS_NAMES, SPLITS
 from .models import SchemaAudit
 from .utils import (
+    atomic_write_json,
     atomic_write_yaml,
     classification_yaml_payload,
     detection_yaml_payload,
@@ -77,6 +78,24 @@ def initialize_empty_datasets(
         atomic_write_yaml(
             classification_root / "canbang.yaml",
             balance_payload(zero_counts, 0, "Initialized by CVAT Nhai"),
+        )
+    stats_path = classification_root / "stats.json"
+    if not stats_path.exists():
+        atomic_write_json(
+            stats_path,
+            {
+                "mode": "crop-box",
+                "base_padding": 0.08,
+                "splits": {
+                    split: {
+                        "classes": {
+                            class_name: 0 for class_name in CLASS_NAMES
+                        },
+                        "skipped": {},
+                    }
+                    for split in SPLITS
+                },
+            },
         )
 
 
