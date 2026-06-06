@@ -310,9 +310,7 @@ class AnnotationCanvas(QWidget):
         if not active:
             pen.setStyle(Qt.DashLine)
         painter.setPen(pen)
-        fill = QColor(color)
-        fill.setAlpha(32 if active else 14)
-        painter.setBrush(fill)
+        painter.setBrush(Qt.NoBrush)
         painter.drawRect(box_rect)
 
         metrics = painter.fontMetrics()
