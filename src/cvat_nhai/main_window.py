@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -38,6 +37,7 @@ from .migration import apply_migration
 from .models import BBox, DatasetPaths, MigrationReport
 from .scanner import scan_images
 from .schema import audit_schema, initialize_empty_datasets
+from .seek_slider import SeekSlider
 from .settings_dialog import SettingsDialog
 from .workers import FunctionTask
 from .yolo_editor import (
@@ -222,9 +222,12 @@ class MainWindow(QMainWindow):
         progress_row.addStretch()
         progress_row.addWidget(self.position_label)
         side.addLayout(progress_row)
-        self.progress = QProgressBar()
-        self.progress.setTextVisible(False)
-        self.progress.setFixedHeight(6)
+        self.progress = SeekSlider()
+        self.progress.setRange(0, 0)
+        self.progress.setEnabled(False)
+        self.progress.setFixedHeight(18)
+        self.progress.seek_requested.connect(self.seek_to_index)
+        self.progress.valueChanged.connect(self._preview_seek_position)
         side.addWidget(self.progress)
 
         class_label = QLabel("CHON CLASS (PHIM 1-5)")
@@ -434,8 +437,31 @@ class MainWindow(QMainWindow):
                 padding: 6px 10px;
                 font-weight: 600;
             }
-            QProgressBar { background: #1E293B; border: 0; border-radius: 3px; }
-            QProgressBar::chunk { background: #0EA5E9; border-radius: 3px; }
+            QSlider::groove:horizontal {
+                background: #1E293B;
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #0EA5E9;
+                border-radius: 3px;
+            }
+            QSlider::add-page:horizontal {
+                background: #1E293B;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #E2E8F0;
+                border: 1px solid #0EA5E9;
+                width: 13px;
+                margin: -4px 0;
+                border-radius: 6px;
+            }
+            QSlider:disabled::handle:horizontal {
+                background: transparent;
+                border: 0;
+                width: 1px;
+            }
             QStatusBar { background: #0F172A; color: #94A3B8; }
             """
         )
@@ -498,6 +524,7 @@ class MainWindow(QMainWindow):
         self.undo_button.setVisible(not editing)
         self.remove_box_button.setVisible(editing)
         self.export_button.setVisible(editing)
+        self.progress.setEnabled(editing)
         self.commit_button.setText(
             (
                 "ENTER  Ap dung thay doi"
@@ -677,7 +704,7 @@ class MainWindow(QMainWindow):
         self.current_index = 0
         self.image_cache.clear()
         self.queue_label.setText("{} anh dataset".format(len(self.images)))
-        self.progress.setMaximum(max(1, len(self.images)))
+        self.progress.setRange(0, max(0, len(self.images) - 1))
         self.progress.setValue(0)
         self.schema_badge.setText(
             "{} lop - sua YOLO".format(len(result.class_names))
@@ -705,7 +732,7 @@ class MainWindow(QMainWindow):
         self.current_index = 0
         self.image_cache.clear()
         self.queue_label.setText("{} anh".format(len(self.images)))
-        self.progress.setMaximum(max(1, len(self.images)))
+        self.progress.setRange(0, max(0, len(self.images) - 1))
         self.progress.setValue(0)
         self.statusBar().showMessage(
             "Da tim thay {} anh".format(len(self.images)),
@@ -725,7 +752,8 @@ class MainWindow(QMainWindow):
             self.path_label.clear()
             self.position_label.setText("0 / 0")
             self.queue_label.setText("0 anh")
-            self.progress.setValue(self.progress.maximum())
+            self.progress.setRange(0, 0)
+            self.progress.setValue(0)
             return
 
         self.current_index = max(0, min(self.current_index, len(self.images) - 1))
@@ -742,7 +770,7 @@ class MainWindow(QMainWindow):
                 else "{} anh con lai".format(len(self.images))
             )
         )
-        self.progress.setMaximum(max(1, len(self.images)))
+        self.progress.setRange(0, max(0, len(self.images) - 1))
         self.progress.setValue(self.current_index)
         self.canvas.reset_annotation()
         self._load_image(self.current_path, display=True)
@@ -1157,6 +1185,31 @@ class MainWindow(QMainWindow):
         if 0 <= new_index < len(self.images):
             self.current_index = new_index
             self.show_current()
+
+    def seek_to_index(self, index: int) -> None:
+        if self.mode != "edit" or self.busy or not self.images:
+            return
+        target = max(0, min(int(index), len(self.images) - 1))
+        if self._editor_is_dirty():
+            self.progress.setValue(self.current_index)
+            self.statusBar().showMessage(
+                "Nhan Enter de luu hoac F de bo thay doi truoc khi keo thanh",
+                5000,
+            )
+            return
+        if target == self.current_index:
+            return
+        self.current_index = target
+        self.show_current()
+
+    def _preview_seek_position(self, index: int) -> None:
+        if self.mode == "edit" and self.images:
+            self.position_label.setText(
+                "{} / {}".format(
+                    max(0, min(index, len(self.images) - 1)) + 1,
+                    len(self.images),
+                )
+            )
 
     def _set_busy(self, busy: bool, message: str = "") -> None:
         self.busy = busy

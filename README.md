@@ -81,6 +81,10 @@ hien thi tat ca bbox/class da co.
   `<dataset>\.cvat_nhai_editor_archive`.
 - `A` / `D` chi chuyen anh khi thay doi hien tai da duoc `Enter` hoac `F`,
   tranh mat nhan dang sua.
+- Thanh tien do co the click hoac keo nhanh toi bat ky anh nao. Trong luc
+  keo chi cap nhat so thu tu; anh chi duoc tai mot lan khi tha chuot.
+  `Left/Right` di mot anh, `PageUp/PageDown` nhay 100 anh. Thanh se tu quay
+  lai vi tri hien tai neu anh dang co thay doi chua `Enter` hoac `F`.
 
 Editor chi nhan YOLO bounding-box 5 cot:
 

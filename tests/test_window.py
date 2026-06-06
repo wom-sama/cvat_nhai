@@ -150,8 +150,30 @@ def test_yolo_editor_mode_loads_resets_saves_and_deletes(
     current_before_navigation = window.current_path
     window.navigate(-1)
     assert window.current_path == current_before_navigation
+    window.seek_to_index(0)
+    assert window.current_path == current_before_navigation
+    assert window.progress.value() == window.current_index
     window.reset_annotation()
     assert window.canvas.annotations[0].class_id == 2
+
+    window.seek_to_index(0)
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == first_image
+            and len(window.canvas.annotations) == 2
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    window.seek_to_index(1)
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == second_image
+            and len(window.canvas.annotations) == 1
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
 
     window.delete_current()
     qtbot.waitUntil(
