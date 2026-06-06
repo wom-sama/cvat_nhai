@@ -64,6 +64,44 @@ py -m venv .venv
 - `Ctrl+Z`: hoan tac thao tac ghi/xoa gan nhat.
 - `A` / `D`: xem anh truoc / sau ma chua xu ly.
 
+## Xem va sua dataset YOLO cu
+
+Chon che do `Xem / sua dataset YOLO cu`, sau do chon thu muc co
+`data.yaml`. Tool doc cac split trong YAML, ghep `images` voi `labels` va
+hien thi tat ca bbox/class da co.
+
+- Click mot box de chon object.
+- Keo box hoac 8 handle de move/resize.
+- Nhan `1` den `5` de doi class cua object dang chon.
+- Keo tren vung trong de them object moi.
+- `Backspace` xoa rieng object dang chon trong bo nho.
+- `Enter` backup label cu, ghi label moi theo kieu atomic va sang anh tiep.
+- `F` bo moi thay doi chua luu va tai lai snapshot nhan da co.
+- `Delete` chuyen ca anh va label vao
+  `<dataset>\.cvat_nhai_editor_archive`.
+- `A` / `D` chi chuyen anh khi thay doi hien tai da duoc `Enter` hoac `F`,
+  tranh mat nhan dang sua.
+
+Editor chi nhan YOLO bounding-box 5 cot:
+
+```text
+class_id center_x center_y width height
+```
+
+Nhan segmentation/polygon se bi tu choi va khong bi ghi de.
+
+Nut `Xuat classification folder tu nhan da sua` tao:
+
+```text
+<export>\train\<class_name>\*_boxNNN.jpg
+<export>\val\<class_name>\*_boxNNN.jpg
+<export>\test\<class_name>\*_boxNNN.jpg
+```
+
+Kem theo `data.yaml`, `manifest.csv`, `stats.json` va `canbang.yaml`.
+Thu muc export bat buoc phai rong; ket qua duoc dung trong thu muc tam va
+chi duoc dua vao dich sau khi toan bo crop thanh cong.
+
 Anh bi xoa duoc di chuyen vao `work/archive/removed` thay vi xoa vinh vien.
 Dieu nay giu toc do thao tac nhanh nhung van cho phep `Ctrl+Z`.
 

@@ -3,7 +3,9 @@ from pathlib import Path
 from PIL import Image
 
 from cvat_nhai.main_window import MainWindow
+from cvat_nhai.models import BBox, YoloAnnotation
 from cvat_nhai.schema import audit_schema
+from cvat_nhai.utils import atomic_write_yaml
 
 
 def test_main_window_smoke(qtbot) -> None:
@@ -73,3 +75,91 @@ def test_destination_root_creates_both_five_class_datasets(
         window.detection_root,
         window.classification_root,
     ).ready
+
+
+def test_yolo_editor_mode_loads_resets_saves_and_deletes(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "old_yolo"
+    for split in ("train", "val", "test"):
+        (root / "images" / split).mkdir(parents=True)
+        (root / "labels" / split).mkdir(parents=True)
+    atomic_write_yaml(
+        root / "data.yaml",
+        {
+            "path": str(root),
+            "train": "images/train",
+            "val": "images/val",
+            "test": "images/test",
+            "nc": 3,
+            "names": ["green", "ripe", "bad"],
+        },
+    )
+    first_image = root / "images" / "train" / "a.jpg"
+    second_image = root / "images" / "val" / "b.jpg"
+    Image.new("RGB", (200, 100), "green").save(first_image)
+    Image.new("RGB", (100, 100), "orange").save(second_image)
+    first_label = root / "labels" / "train" / "a.txt"
+    second_label = root / "labels" / "val" / "b.txt"
+    first_label.write_text(
+        "0 0.250000 0.500000 0.400000 0.600000\n"
+        "1 0.750000 0.500000 0.400000 0.600000\n",
+        encoding="utf-8",
+    )
+    second_label.write_text(
+        "2 0.500000 0.500000 0.500000 0.500000\n",
+        encoding="utf-8",
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.mode_combo.setCurrentIndex(1)
+    window.source_edit.setText(str(root))
+    window.scan_source()
+    qtbot.waitUntil(
+        lambda: (
+            len(window.images) == 2
+            and len(window.canvas.annotations) == 2
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+
+    changed = (
+        YoloAnnotation(2, BBox(20, 10, 180, 90)),
+        window.canvas.annotations[1],
+    )
+    window.canvas.set_annotations(changed, 0)
+    window.commit_current()
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == second_image
+            and not window.active_tasks
+            and len(window.canvas.annotations) == 1
+        ),
+        timeout=5000,
+    )
+    assert first_label.read_text(encoding="utf-8").splitlines()[0].startswith(
+        "2 0.500000 0.500000 0.800000 0.800000"
+    )
+
+    window.select_class(0)
+    assert window.canvas.annotations[0].class_id == 0
+    current_before_navigation = window.current_path
+    window.navigate(-1)
+    assert window.current_path == current_before_navigation
+    window.reset_annotation()
+    assert window.canvas.annotations[0].class_id == 2
+
+    window.delete_current()
+    qtbot.waitUntil(
+        lambda: (
+            len(window.images) == 1
+            and not second_image.exists()
+            and not second_label.exists()
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )

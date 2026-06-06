@@ -65,6 +65,57 @@ class BBox:
             box.y2 + pad_y,
         ).clamp(image_width, image_height)
 
+    @classmethod
+    def from_yolo(
+        cls,
+        center_x: float,
+        center_y: float,
+        width: float,
+        height: float,
+        image_width: int,
+        image_height: int,
+    ) -> "BBox":
+        pixel_width = width * image_width
+        pixel_height = height * image_height
+        pixel_center_x = center_x * image_width
+        pixel_center_y = center_y * image_height
+        return cls(
+            pixel_center_x - pixel_width / 2.0,
+            pixel_center_y - pixel_height / 2.0,
+            pixel_center_x + pixel_width / 2.0,
+            pixel_center_y + pixel_height / 2.0,
+        ).clamp(image_width, image_height)
+
+
+@dataclass(frozen=True)
+class YoloAnnotation:
+    class_id: int
+    bbox: BBox
+
+
+@dataclass(frozen=True)
+class YoloSample:
+    image_path: Path
+    label_path: Path
+    split: str
+
+
+@dataclass(frozen=True)
+class YoloDatasetIndex:
+    root: Path
+    data_yaml: Path
+    class_names: Tuple[str, ...]
+    samples: Tuple[YoloSample, ...]
+
+
+@dataclass(frozen=True)
+class ExportReport:
+    destination: Path
+    images: int
+    objects: int
+    skipped: int
+    class_counts: Dict[int, int]
+
 
 @dataclass(frozen=True)
 class DatasetPaths:

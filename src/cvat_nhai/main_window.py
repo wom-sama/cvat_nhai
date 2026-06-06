@@ -1,12 +1,10 @@
-import sys
 from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QSettings, QSize, Qt, QThreadPool, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QImageReader, QKeySequence, QPainter, QPixmap
+from PySide6.QtCore import QSettings, Qt, QThreadPool, Signal
+from PySide6.QtGui import QAction, QImage, QImageReader, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -36,12 +34,19 @@ from .constants import (
     DEFAULT_DETECTION_ROOT,
 )
 from .dataset import DatasetError, DatasetManager
-from .migration import apply_migration, plan_migration
+from .migration import apply_migration
 from .models import BBox, DatasetPaths, MigrationReport
 from .scanner import scan_images
 from .schema import audit_schema, initialize_empty_datasets
 from .settings_dialog import SettingsDialog
 from .workers import FunctionTask
+from .yolo_editor import (
+    YoloDatasetEditor,
+    YoloEditorError,
+    export_classification_folder,
+    read_yolo_annotations,
+    scan_yolo_dataset,
+)
 
 
 def load_qimage(path: Path) -> QImage:
@@ -99,6 +104,12 @@ class MainWindow(QMainWindow):
         ) if self.settings.value("source/root", "") else None
 
         self.manager = self._make_manager()
+        self.mode = "label"
+        self.active_class_names = tuple(CLASS_NAMES)
+        self.editor_index = None
+        self.editor_manager = None
+        self.editor_samples_by_path = {}
+        self.editor_original_annotations = ()
         self.images: List[Path] = []
         self.current_index = 0
         self.current_path: Optional[Path] = None
@@ -148,9 +159,18 @@ class MainWindow(QMainWindow):
         side.addWidget(title)
         side.addWidget(subtitle)
 
-        source_label = QLabel("THU MUC NGUON")
-        source_label.setObjectName("sectionLabel")
-        side.addWidget(source_label)
+        mode_label = QLabel("CHE DO")
+        mode_label.setObjectName("sectionLabel")
+        side.addWidget(mode_label)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Gan nhan anh moi", "label")
+        self.mode_combo.addItem("Xem / sua dataset YOLO cu", "edit")
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        side.addWidget(self.mode_combo)
+
+        self.source_label = QLabel("THU MUC NGUON")
+        self.source_label.setObjectName("sectionLabel")
+        side.addWidget(self.source_label)
         source_row = QHBoxLayout()
         self.source_edit = QLineEdit()
         self.source_edit.setPlaceholderText("Chon thu muc anh can gan lai nhan")
@@ -167,9 +187,9 @@ class MainWindow(QMainWindow):
         self.scan_button.clicked.connect(self.scan_source)
         side.addWidget(self.scan_button)
 
-        destination_label = QLabel("THU MUC DICH")
-        destination_label.setObjectName("sectionLabel")
-        side.addWidget(destination_label)
+        self.destination_label = QLabel("THU MUC DICH")
+        self.destination_label.setObjectName("sectionLabel")
+        side.addWidget(self.destination_label)
         destination_row = QHBoxLayout()
         self.destination_edit = QLineEdit()
         self.destination_edit.setPlaceholderText(
@@ -180,12 +200,12 @@ class MainWindow(QMainWindow):
         self.destination_edit.returnPressed.connect(
             self.apply_destination_from_text
         )
-        destination_browse = QToolButton()
-        destination_browse.setText("...")
-        destination_browse.setToolTip("Chon thu muc dich")
-        destination_browse.clicked.connect(self.choose_destination)
+        self.destination_browse = QToolButton()
+        self.destination_browse.setText("...")
+        self.destination_browse.setToolTip("Chon thu muc dich")
+        self.destination_browse.clicked.connect(self.choose_destination)
         destination_row.addWidget(self.destination_edit)
-        destination_row.addWidget(destination_browse)
+        destination_row.addWidget(self.destination_browse)
         side.addLayout(destination_row)
         self.destination_hint = QLabel(
             "Tao: dataset (YOLO) + cls_crops (classification)"
@@ -227,7 +247,8 @@ class MainWindow(QMainWindow):
             side.addWidget(button)
 
         split_row = QHBoxLayout()
-        split_row.addWidget(QLabel("Split:"))
+        self.split_label = QLabel("Split:")
+        split_row.addWidget(self.split_label)
         self.split_combo = QComboBox()
         self.split_combo.addItem("Tu dong 70/20/10", "auto")
         self.split_combo.addItem("Train", "train")
@@ -265,9 +286,21 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.delete_button)
         side.addLayout(action_row)
 
-        undo = QPushButton("Ctrl+Z  Hoan tac thao tac gan nhat")
-        undo.clicked.connect(self.undo_latest)
-        side.addWidget(undo)
+        self.undo_button = QPushButton("Ctrl+Z  Hoan tac thao tac gan nhat")
+        self.undo_button.clicked.connect(self.undo_latest)
+        side.addWidget(self.undo_button)
+
+        self.remove_box_button = QPushButton("Backspace  Xoa box dang chon")
+        self.remove_box_button.clicked.connect(self.remove_active_box)
+        self.remove_box_button.setVisible(False)
+        side.addWidget(self.remove_box_button)
+
+        self.export_button = QPushButton(
+            "Xuat classification folder tu nhan da sua"
+        )
+        self.export_button.clicked.connect(self.export_editor_dataset)
+        self.export_button.setVisible(False)
+        side.addWidget(self.export_button)
 
         side_scroll = QScrollArea()
         side_scroll.setObjectName("sideScroll")
@@ -306,16 +339,20 @@ class MainWindow(QMainWindow):
         content_layout.addLayout(top)
 
         self.canvas = AnnotationCanvas()
+        self.canvas.set_class_catalog(CLASS_NAMES, CLASS_COLORS)
         self.canvas.bbox_changed.connect(self._bbox_changed)
+        self.canvas.active_annotation_changed.connect(
+            self._active_annotation_changed
+        )
         content_layout.addWidget(self.canvas, 1)
 
         help_row = QHBoxLayout()
-        help_text = QLabel(
+        self.help_text = QLabel(
             "Keo chuot: tao bbox   |   Keo trong khung: di chuyen   |   "
             "Keo diem vuong: resize   |   Wheel: zoom   |   Space+drag: pan   |   A/D: anh truoc/sau"
         )
-        help_text.setObjectName("muted")
-        help_row.addWidget(help_text)
+        self.help_text.setObjectName("muted")
+        help_row.addWidget(self.help_text)
         help_row.addStretch()
         fit_button = QPushButton("Fit anh")
         fit_button.clicked.connect(self.canvas.fit_to_view)
@@ -406,12 +443,113 @@ class MainWindow(QMainWindow):
     def choose_source(self) -> None:
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Chon thu muc anh nguon",
+            (
+                "Chon dataset YOLO co data.yaml"
+                if self.mode == "edit"
+                else "Chon thu muc anh nguon"
+            ),
             self.source_edit.text() or str(Path.home()),
         )
         if folder:
             self.source_edit.setText(folder)
             self.scan_source()
+
+    def _mode_changed(self) -> None:
+        mode = str(self.mode_combo.currentData())
+        if mode == self.mode:
+            return
+        self.mode = mode
+        self.images = []
+        self.current_index = 0
+        self.current_path = None
+        self.editor_index = None
+        self.editor_manager = None
+        self.editor_samples_by_path = {}
+        self.editor_original_annotations = ()
+        self.image_cache.clear()
+        self.canvas.clear_image()
+        self.file_label.setText("Chua co anh")
+        self.path_label.clear()
+        self.queue_label.setText("0 anh")
+        self.position_label.setText("0 / 0")
+        self.progress.setValue(0)
+        self.source_edit.clear()
+
+        editing = mode == "edit"
+        self.source_label.setText(
+            "DATASET YOLO CU" if editing else "THU MUC NGUON"
+        )
+        self.source_edit.setPlaceholderText(
+            (
+                "Chon thu muc chua data.yaml"
+                if editing
+                else "Chon thu muc anh can gan lai nhan"
+            )
+        )
+        self.scan_button.setText(
+            "Mo dataset YOLO" if editing else "Quet anh"
+        )
+        self.destination_label.setVisible(not editing)
+        self.destination_edit.setVisible(not editing)
+        self.destination_browse.setVisible(not editing)
+        self.destination_hint.setVisible(not editing)
+        self.split_label.setVisible(not editing)
+        self.split_combo.setVisible(not editing)
+        self.undo_button.setVisible(not editing)
+        self.remove_box_button.setVisible(editing)
+        self.export_button.setVisible(editing)
+        self.commit_button.setText(
+            (
+                "ENTER  Ap dung thay doi"
+                if editing
+                else "ENTER  Luu va chuyen anh"
+            )
+        )
+        self.reset_button.setText(
+            "F  Ve nhan goc" if editing else "F  Lam lai"
+        )
+        self.delete_button.setText(
+            "DEL  Xoa anh + nhan" if editing else "DEL  Loai bo"
+        )
+        self.help_text.setText(
+            (
+                "Click box: chon object   |   Keo/resize: sua box   |   "
+                "Keo vung trong: them box   |   Backspace: xoa box   |   A/D: anh truoc/sau"
+                if editing
+                else "Keo chuot: tao bbox   |   Keo trong khung: di chuyen   |   "
+                "Keo diem vuong: resize   |   Wheel: zoom   |   Space+drag: pan   |   A/D: anh truoc/sau"
+            )
+        )
+        self._configure_class_buttons(CLASS_NAMES)
+        self._update_schema_status()
+
+    def _configure_class_buttons(self, names) -> None:
+        if len(names) > len(self.class_buttons):
+            raise YoloEditorError(
+                "UI hien tai ho tro toi da {} class".format(
+                    len(self.class_buttons)
+                )
+            )
+        self.active_class_names = tuple(str(name) for name in names)
+        for index, button in enumerate(self.class_buttons):
+            visible = index < len(self.active_class_names)
+            button.setVisible(visible)
+            button.setChecked(False)
+            if visible:
+                name = self.active_class_names[index]
+                label = (
+                    CLASS_LABELS[index]
+                    if tuple(names) == CLASS_NAMES
+                    else name
+                )
+                button.setText(
+                    "{}   {}\n     {}".format(index + 1, label, name)
+                )
+        self.canvas.set_class_catalog(
+            self.active_class_names,
+            CLASS_COLORS[: len(self.active_class_names)],
+        )
+        self.selected_class = -1
 
     def choose_destination(self) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -476,6 +614,9 @@ class MainWindow(QMainWindow):
         if not root.is_dir():
             self._show_error("Thu muc khong ton tai: {}".format(root))
             return
+        if self.mode == "edit":
+            self._scan_editor_dataset(root)
+            return
         self.source_root = root.resolve()
         self.settings.setValue("source/root", str(self.source_root))
         self.scan_button.setEnabled(False)
@@ -499,6 +640,57 @@ class MainWindow(QMainWindow):
             )
         )
         self._start_task(task)
+
+    def _scan_editor_dataset(self, root: Path) -> None:
+        self.scan_button.setEnabled(False)
+        self.scan_button.setText("Dang mo dataset...")
+        self.statusBar().showMessage(
+            "Dang doc data.yaml va ghep cap images/labels..."
+        )
+        task = FunctionTask(scan_yolo_dataset, root)
+        task.signals.succeeded.connect(self._editor_scan_finished)
+        task.signals.failed.connect(self._background_failed)
+        task.signals.finished.connect(
+            lambda: (
+                self.scan_button.setEnabled(True),
+                self.scan_button.setText("Mo dataset YOLO"),
+            )
+        )
+        self._start_task(task)
+
+    def _editor_scan_finished(self, result: object) -> None:
+        if len(result.class_names) > len(self.class_buttons):
+            self._show_error(
+                "Dataset co {} class, UI hien tai ho tro toi da {}".format(
+                    len(result.class_names),
+                    len(self.class_buttons),
+                )
+            )
+            return
+        self.editor_index = result
+        self.editor_manager = YoloDatasetEditor(result)
+        self.editor_samples_by_path = {
+            sample.image_path: sample for sample in result.samples
+        }
+        self._configure_class_buttons(result.class_names)
+        self.images = [sample.image_path for sample in result.samples]
+        self.current_index = 0
+        self.image_cache.clear()
+        self.queue_label.setText("{} anh dataset".format(len(self.images)))
+        self.progress.setMaximum(max(1, len(self.images)))
+        self.progress.setValue(0)
+        self.schema_badge.setText(
+            "{} lop - sua YOLO".format(len(result.class_names))
+        )
+        self.schema_badge.setStyleSheet(
+            "background:#172554;color:#93C5FD;"
+        )
+        self.migrate_button.setVisible(False)
+        self.statusBar().showMessage(
+            "Da mo {} anh tu {}".format(len(self.images), result.data_yaml),
+            5000,
+        )
+        self.show_current()
 
     def _start_task(self, task: FunctionTask) -> None:
         """Keep the Python QRunnable wrapper alive until queued signals finish."""
@@ -543,7 +735,13 @@ class MainWindow(QMainWindow):
         self.position_label.setText(
             "{} / {}".format(self.current_index + 1, len(self.images))
         )
-        self.queue_label.setText("{} anh con lai".format(len(self.images)))
+        self.queue_label.setText(
+            (
+                "{} anh dataset".format(len(self.images))
+                if self.mode == "edit"
+                else "{} anh con lai".format(len(self.images))
+            )
+        )
         self.progress.setMaximum(max(1, len(self.images)))
         self.progress.setValue(self.current_index)
         self.canvas.reset_annotation()
@@ -558,6 +756,8 @@ class MainWindow(QMainWindow):
             self.image_cache.move_to_end(key)
             if display and self.current_path == path:
                 self.canvas.set_image(cached)
+                if self.mode == "edit":
+                    self._load_editor_annotations(path, cached)
                 self._bbox_changed(None)
             return
         if key in self.pending_loads:
@@ -591,27 +791,117 @@ class MainWindow(QMainWindow):
             self.image_cache.popitem(last=False)
         if display and self.current_path == path:
             self.canvas.set_image(image)
+            if self.mode == "edit":
+                self._load_editor_annotations(path, image)
             self.statusBar().showMessage(
                 "{} x {} px".format(image.width(), image.height()),
                 3000,
             )
 
+    def _load_editor_annotations(self, path: Path, image: QImage) -> None:
+        sample = self.editor_samples_by_path.get(path)
+        if sample is None or self.editor_index is None:
+            return
+        try:
+            annotations = tuple(
+                read_yolo_annotations(
+                    sample.label_path,
+                    image.width(),
+                    image.height(),
+                    len(self.editor_index.class_names),
+                )
+            )
+        except Exception as error:
+            self.canvas.set_annotations((), 0)
+            self.editor_original_annotations = ()
+            self._show_error(str(error))
+            return
+        self.editor_original_annotations = annotations
+        self.canvas.set_annotations(annotations, 0)
+        if annotations:
+            self._select_class_ui(annotations[0].class_id)
+        else:
+            self._select_class_ui(0)
+        self._update_object_status()
+
     def select_class(self, class_id: int) -> None:
+        if not 0 <= class_id < len(self.active_class_names):
+            return
+        self._select_class_ui(class_id)
+        if self.mode == "edit":
+            self.canvas.update_active_class(class_id)
+            self._update_object_status()
+
+    def _select_class_ui(self, class_id: int) -> None:
         self.selected_class = class_id
         for index, button in enumerate(self.class_buttons):
             button.setChecked(index == class_id)
+        name = self.active_class_names[class_id]
+        label = (
+            CLASS_LABELS[class_id]
+            if self.active_class_names == CLASS_NAMES
+            else name
+        )
         self.canvas.set_class_style(
-            CLASS_LABELS[class_id],
+            label,
             CLASS_COLORS[class_id],
+            class_id,
         )
         self.statusBar().showMessage(
-            "Class {}: {}".format(class_id, CLASS_NAMES[class_id]),
+            "Class {}: {}".format(class_id, name),
             2500,
         )
         self.canvas.setFocus()
 
+    def _active_annotation_changed(self, index: int) -> None:
+        if self.mode != "edit":
+            return
+        annotations = self.canvas.annotations
+        if 0 <= index < len(annotations):
+            self._select_class_ui(annotations[index].class_id)
+        self._update_object_status()
+
+    def _update_object_status(self) -> None:
+        if self.mode != "edit":
+            return
+        count = len(self.canvas.annotations)
+        active = self.canvas.active_index
+        self.bbox_label.setText(
+            (
+                "Object: {} / {}{} | Backspace xoa box".format(
+                    active + 1,
+                    count,
+                    " | CHUA LUU" if self._editor_is_dirty() else "",
+                )
+                if active >= 0
+                else "Object: 0 / {}{} | Keo de them box".format(
+                    count,
+                    " | CHUA LUU" if self._editor_is_dirty() else "",
+                )
+            )
+        )
+
+    def _editor_is_dirty(self) -> bool:
+        return (
+            self.mode == "edit"
+            and tuple(self.canvas.annotations)
+            != tuple(self.editor_original_annotations)
+        )
+
     def reset_annotation(self) -> None:
         if self.busy:
+            return
+        if self.mode == "edit":
+            self.canvas.set_annotations(self.editor_original_annotations, 0)
+            if self.editor_original_annotations:
+                self._select_class_ui(
+                    self.editor_original_annotations[0].class_id
+                )
+            self._update_object_status()
+            self.statusBar().showMessage(
+                "Da khoi phuc nhan goc cua anh hien tai",
+                3000,
+            )
             return
         self.selected_class = -1
         for button in self.class_buttons:
@@ -621,6 +911,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Da reset bbox va class", 2500)
 
     def _bbox_changed(self, value: object) -> None:
+        if self.mode == "edit":
+            self._update_object_status()
+            return
         if isinstance(value, BBox):
             self.bbox_label.setText(
                 "BBox: {:.0f} x {:.0f} px".format(value.width, value.height)
@@ -630,6 +923,9 @@ class MainWindow(QMainWindow):
 
     def commit_current(self) -> None:
         if self.busy or self.current_path is None:
+            return
+        if self.mode == "edit":
+            self._commit_editor_current()
             return
         if self.selected_class < 0:
             self.statusBar().showMessage("Chon class bang phim 1-5", 3500)
@@ -664,8 +960,48 @@ class MainWindow(QMainWindow):
         task.signals.finished.connect(lambda: self._set_busy(False))
         self._start_task(task)
 
+    def _commit_editor_current(self) -> None:
+        if (
+            self.editor_manager is None
+            or self.editor_index is None
+            or self.current_path is None
+        ):
+            return
+        sample = self.editor_samples_by_path.get(self.current_path)
+        if sample is None:
+            return
+        width, height = self.canvas.image_size
+        annotations = self.canvas.annotations
+        self._set_busy(True, "Dang backup va ghi label YOLO...")
+        task = FunctionTask(
+            self.editor_manager.save_annotations,
+            sample,
+            annotations,
+            width,
+            height,
+        )
+        task.signals.succeeded.connect(
+            lambda _, saved=annotations: self._editor_save_finished(saved)
+        )
+        task.signals.failed.connect(self._background_failed)
+        task.signals.finished.connect(lambda: self._set_busy(False))
+        self._start_task(task)
+
+    def _editor_save_finished(self, annotations) -> None:
+        self.editor_original_annotations = tuple(annotations)
+        self.statusBar().showMessage(
+            "Da ap dung {} object vao label".format(len(annotations)),
+            4000,
+        )
+        if self.current_index + 1 < len(self.images):
+            self.current_index += 1
+            self.show_current()
+
     def delete_current(self) -> None:
         if self.busy or self.current_path is None:
+            return
+        if self.mode == "edit":
+            self._delete_editor_current()
             return
         path = self.current_path
         self._set_busy(True, "Dang dua anh vao safety archive...")
@@ -676,6 +1012,96 @@ class MainWindow(QMainWindow):
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(lambda: self._set_busy(False))
         self._start_task(task)
+
+    def _delete_editor_current(self) -> None:
+        if self.editor_manager is None or self.current_path is None:
+            return
+        sample = self.editor_samples_by_path.get(self.current_path)
+        if sample is None:
+            return
+        width, height = self.canvas.image_size
+        path = self.current_path
+        self._set_busy(True, "Dang archive anh va label...")
+        task = FunctionTask(
+            self.editor_manager.delete_sample,
+            sample,
+            width,
+            height,
+        )
+        task.signals.succeeded.connect(
+            lambda _, value=path: self._editor_delete_finished(value)
+        )
+        task.signals.failed.connect(self._background_failed)
+        task.signals.finished.connect(lambda: self._set_busy(False))
+        self._start_task(task)
+
+    def _editor_delete_finished(self, path: Path) -> None:
+        self.editor_samples_by_path.pop(path, None)
+        if path in self.images:
+            self.images.remove(path)
+        self.image_cache.pop(str(path), None)
+        self.current_index = min(
+            self.current_index,
+            max(0, len(self.images) - 1),
+        )
+        self.statusBar().showMessage(
+            "Da xoa anh + label vao .cvat_nhai_editor_archive",
+            5000,
+        )
+        self.show_current()
+
+    def remove_active_box(self) -> None:
+        if self.mode != "edit" or self.busy:
+            return
+        if self.canvas.remove_active_annotation():
+            self._update_object_status()
+            self.statusBar().showMessage(
+                "Da xoa box trong bo nho; Enter de ap dung, F de phuc hoi",
+                4000,
+            )
+
+    def export_editor_dataset(self) -> None:
+        if self.mode != "edit" or self.editor_index is None or self.busy:
+            return
+        if self._editor_is_dirty():
+            self.statusBar().showMessage(
+                "Anh hien tai chua luu: nhan Enter hoac F truoc khi export",
+                5000,
+            )
+            return
+        destination = QFileDialog.getExistingDirectory(
+            self,
+            "Chon thu muc rong de export classification folder",
+            str(self.editor_index.root.parent),
+        )
+        if not destination:
+            return
+        path = Path(destination)
+        if any(path.iterdir()):
+            self._show_error("Thu muc export phai rong")
+            return
+        self._set_busy(True, "Dang crop va export classification folder...")
+        task = FunctionTask(
+            export_classification_folder,
+            self.editor_index,
+            path,
+            self.crop_padding,
+        )
+        task.signals.succeeded.connect(self._export_finished)
+        task.signals.failed.connect(self._background_failed)
+        task.signals.finished.connect(lambda: self._set_busy(False))
+        self._start_task(task)
+
+    def _export_finished(self, result: object) -> None:
+        QMessageBox.information(
+            self,
+            "Export hoan tat",
+            "Da xuat {} crop tu {} anh.\nDich: {}".format(
+                result.objects,
+                result.images,
+                result.destination,
+            ),
+        )
 
     def _operation_finished(self, path: Path, result: object) -> None:
         if path in self.images:
@@ -721,6 +1147,12 @@ class MainWindow(QMainWindow):
     def navigate(self, delta: int) -> None:
         if self.busy or not self.images:
             return
+        if self.mode == "edit" and self._editor_is_dirty():
+            self.statusBar().showMessage(
+                "Nhan Enter de luu hoac F de bo thay doi truoc khi chuyen anh",
+                5000,
+            )
+            return
         new_index = self.current_index + delta
         if 0 <= new_index < len(self.images):
             self.current_index = new_index
@@ -732,10 +1164,30 @@ class MainWindow(QMainWindow):
         self.delete_button.setEnabled(not busy)
         self.reset_button.setEnabled(not busy)
         self.scan_button.setEnabled(not busy)
+        self.mode_combo.setEnabled(not busy)
+        self.export_button.setEnabled(not busy)
+        self.remove_box_button.setEnabled(not busy)
         if message:
             self.statusBar().showMessage(message)
 
     def _update_schema_status(self) -> None:
+        if self.mode == "edit":
+            if self.editor_index is None:
+                self.schema_badge.setText("Chua mo dataset YOLO")
+                self.schema_badge.setStyleSheet(
+                    "background:#1E293B;color:#CBD5E1;"
+                )
+            else:
+                self.schema_badge.setText(
+                    "{} lop - sua YOLO".format(
+                        len(self.editor_index.class_names)
+                    )
+                )
+                self.schema_badge.setStyleSheet(
+                    "background:#172554;color:#93C5FD;"
+                )
+            self.migrate_button.setVisible(False)
+            return
         try:
             audit = audit_schema(
                 self.detection_root,
@@ -856,7 +1308,8 @@ class MainWindow(QMainWindow):
             return
         key = event.key()
         if key == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
-            self.undo_latest()
+            if self.mode != "edit":
+                self.undo_latest()
             event.accept()
             return
         if Qt.Key_1 <= key <= Qt.Key_5:
@@ -881,6 +1334,16 @@ class MainWindow(QMainWindow):
             return
         if key == Qt.Key_D:
             self.navigate(1)
+            event.accept()
+            return
+        if key == Qt.Key_Tab and self.mode == "edit":
+            self.canvas.cycle_active_annotation(
+                -1 if event.modifiers() & Qt.ShiftModifier else 1
+            )
+            event.accept()
+            return
+        if key == Qt.Key_Backspace and self.mode == "edit":
+            self.remove_active_box()
             event.accept()
             return
         super().keyPressEvent(event)
