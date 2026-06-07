@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
@@ -13,13 +13,16 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-from .models import BBox
+from .models import BBox, YoloAnnotation
 
 
 class AnnotationCanvas(QWidget):
     bbox_changed = Signal(object)
+    annotations_changed = Signal(object)
+    active_annotation_changed = Signal(int)
 
     HANDLE_SIZE = 9.0
+    MIN_VISIBLE_BOX_SIZE = 12.0
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -30,6 +33,12 @@ class AnnotationCanvas(QWidget):
         self._image = QImage()
         self._pixmap = QPixmap()
         self._bbox: Optional[BBox] = None
+        self._annotations: List[YoloAnnotation] = []
+        self._active_index = -1
+        self._multi_mode = False
+        self._class_names: Tuple[str, ...] = ()
+        self._class_colors: Tuple[str, ...] = ()
+        self._current_class_id = 0
         self._class_name = ""
         self._class_color = QColor("#22C55E")
         self._zoom = 1.0
@@ -47,6 +56,14 @@ class AnnotationCanvas(QWidget):
         return self._bbox
 
     @property
+    def annotations(self) -> Tuple[YoloAnnotation, ...]:
+        return tuple(self._annotations)
+
+    @property
+    def active_index(self) -> int:
+        return self._active_index
+
+    @property
     def image_size(self) -> Tuple[int, int]:
         return self._image.width(), self._image.height()
 
@@ -54,6 +71,9 @@ class AnnotationCanvas(QWidget):
         self._image = image
         self._pixmap = QPixmap.fromImage(image)
         self._bbox = None
+        self._annotations = []
+        self._active_index = -1
+        self._multi_mode = False
         self.fit_to_view()
         self.update()
 
@@ -61,6 +81,9 @@ class AnnotationCanvas(QWidget):
         self._image = QImage()
         self._pixmap = QPixmap()
         self._bbox = None
+        self._annotations = []
+        self._active_index = -1
+        self._multi_mode = False
         self.update()
 
     def set_bbox(self, bbox: Optional[BBox]) -> None:
@@ -70,12 +93,103 @@ class AnnotationCanvas(QWidget):
         self.bbox_changed.emit(bbox)
         self.update()
 
+    def set_class_catalog(
+        self,
+        names: Sequence[str],
+        colors: Sequence[str],
+    ) -> None:
+        self._class_names = tuple(str(name) for name in names)
+        self._class_colors = tuple(str(color) for color in colors)
+        self.update()
+
+    def set_annotations(
+        self,
+        annotations: Sequence[YoloAnnotation],
+        active_index: int = 0,
+    ) -> None:
+        self._multi_mode = True
+        self._annotations = list(annotations)
+        if self._annotations:
+            self._active_index = max(
+                0,
+                min(active_index, len(self._annotations) - 1),
+            )
+            self._bbox = self._annotations[self._active_index].bbox
+            self._current_class_id = self._annotations[
+                self._active_index
+            ].class_id
+        else:
+            self._active_index = -1
+            self._bbox = None
+        self.bbox_changed.emit(self._bbox)
+        self.active_annotation_changed.emit(self._active_index)
+        self.annotations_changed.emit(tuple(self._annotations))
+        self.update()
+
+    def set_active_annotation(self, index: int) -> None:
+        if not self._annotations:
+            self._active_index = -1
+            self._bbox = None
+        else:
+            self._active_index = index % len(self._annotations)
+            annotation = self._annotations[self._active_index]
+            self._bbox = annotation.bbox
+            self._current_class_id = annotation.class_id
+        self.bbox_changed.emit(self._bbox)
+        self.active_annotation_changed.emit(self._active_index)
+        self.update()
+
+    def cycle_active_annotation(self, delta: int = 1) -> None:
+        if self._annotations:
+            self.set_active_annotation(self._active_index + delta)
+
+    def update_active_class(self, class_id: int) -> None:
+        self._current_class_id = class_id
+        if self._multi_mode and 0 <= self._active_index < len(self._annotations):
+            annotation = self._annotations[self._active_index]
+            self._annotations[self._active_index] = YoloAnnotation(
+                class_id=class_id,
+                bbox=annotation.bbox,
+            )
+            self.annotations_changed.emit(tuple(self._annotations))
+        self.update()
+
+    def remove_active_annotation(self) -> bool:
+        if not self._multi_mode or not (
+            0 <= self._active_index < len(self._annotations)
+        ):
+            return False
+        self._annotations.pop(self._active_index)
+        if self._annotations:
+            self._active_index = min(
+                self._active_index,
+                len(self._annotations) - 1,
+            )
+            annotation = self._annotations[self._active_index]
+            self._bbox = annotation.bbox
+            self._current_class_id = annotation.class_id
+        else:
+            self._active_index = -1
+            self._bbox = None
+        self.bbox_changed.emit(self._bbox)
+        self.active_annotation_changed.emit(self._active_index)
+        self.annotations_changed.emit(tuple(self._annotations))
+        self.update()
+        return True
+
     def reset_annotation(self) -> None:
         self.set_bbox(None)
 
-    def set_class_style(self, name: str, color: str) -> None:
+    def set_class_style(
+        self,
+        name: str,
+        color: str,
+        class_id: Optional[int] = None,
+    ) -> None:
         self._class_name = name
         self._class_color = QColor(color)
+        if class_id is not None:
+            self._current_class_id = class_id
         self.update()
 
     def fit_to_view(self) -> None:
@@ -125,19 +239,33 @@ class AnnotationCanvas(QWidget):
             rect.top() + point.y() * scale,
         )
 
-    def _bbox_widget_rect(self) -> QRectF:
-        if self._bbox is None:
+    def _bbox_widget_rect(self, bbox: Optional[BBox] = None) -> QRectF:
+        bbox = bbox if bbox is not None else self._bbox
+        if bbox is None:
             return QRectF()
         top_left = self._image_to_widget(
-            QPointF(self._bbox.x1, self._bbox.y1)
+            QPointF(bbox.x1, bbox.y1)
         )
         bottom_right = self._image_to_widget(
-            QPointF(self._bbox.x2, self._bbox.y2)
+            QPointF(bbox.x2, bbox.y2)
         )
         return QRectF(top_left, bottom_right).normalized()
 
+    def _visible_bbox_widget_rect(self, bbox: BBox) -> QRectF:
+        rect = self._bbox_widget_rect(bbox)
+        width = max(rect.width(), self.MIN_VISIBLE_BOX_SIZE)
+        height = max(rect.height(), self.MIN_VISIBLE_BOX_SIZE)
+        return QRectF(
+            rect.center().x() - width / 2.0,
+            rect.center().y() - height / 2.0,
+            width,
+            height,
+        )
+
     def _handle_points(self) -> dict:
-        rect = self._bbox_widget_rect()
+        if self._bbox is None:
+            return {}
+        rect = self._visible_bbox_widget_rect(self._bbox)
         if rect.isNull():
             return {}
         center = rect.center()
@@ -162,6 +290,80 @@ class AnnotationCanvas(QWidget):
                 return name
         return ""
 
+    def _hit_annotation(self, point: QPointF) -> int:
+        for index in range(len(self._annotations) - 1, -1, -1):
+            if self._visible_bbox_widget_rect(
+                self._annotations[index].bbox
+            ).adjusted(-4, -4, 4, 4).contains(point):
+                return index
+        return -1
+
+    def _annotation_style(self, class_id: int) -> Tuple[str, QColor]:
+        if 0 <= class_id < len(self._class_names):
+            name = self._class_names[class_id]
+        else:
+            name = "Class {}".format(class_id)
+        if 0 <= class_id < len(self._class_colors):
+            color = QColor(self._class_colors[class_id])
+        else:
+            color = QColor("#38BDF8")
+        return name, color
+
+    def _paint_box(
+        self,
+        painter: QPainter,
+        target: QRectF,
+        bbox: BBox,
+        label: str,
+        color: QColor,
+        active: bool,
+    ) -> None:
+        box_rect = self._visible_bbox_widget_rect(bbox)
+        pen = QPen(color, 2.8 if active else 1.8)
+        pen.setCosmetic(True)
+        if not active:
+            pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(box_rect)
+
+        metrics = painter.fontMetrics()
+        label_width = metrics.horizontalAdvance(label) + 16
+        label_height = metrics.height() + 8
+        label_top = max(target.top(), box_rect.top() - label_height)
+        label_rect = QRectF(
+            box_rect.left(),
+            label_top,
+            label_width,
+            label_height,
+        )
+        painter.setPen(Qt.NoPen)
+        label_fill = QColor(color)
+        if not active:
+            label_fill.setAlpha(210)
+        painter.setBrush(label_fill)
+        painter.drawRoundedRect(label_rect, 4, 4)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(
+            label_rect.adjusted(8, 0, -8, 0),
+            Qt.AlignVCenter | Qt.AlignLeft,
+            label,
+        )
+
+        if active:
+            painter.setPen(QPen(QColor("#FFFFFF"), 1))
+            painter.setBrush(color)
+            size = self.HANDLE_SIZE
+            for point in self._handle_points().values():
+                painter.drawRect(
+                    QRectF(
+                        point.x() - size / 2.0,
+                        point.y() - size / 2.0,
+                        size,
+                        size,
+                    )
+                )
+
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -183,50 +385,38 @@ class AnnotationCanvas(QWidget):
         target = self._image_rect()
         painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
 
-        if self._bbox is None:
-            return
-
-        box_rect = self._bbox_widget_rect()
-        pen = QPen(self._class_color, 2.5)
-        pen.setCosmetic(True)
-        painter.setPen(pen)
-        fill = QColor(self._class_color)
-        fill.setAlpha(28)
-        painter.setBrush(fill)
-        painter.drawRect(box_rect)
-
-        label = self._class_name or "BBox"
-        metrics = painter.fontMetrics()
-        label_width = metrics.horizontalAdvance(label) + 16
-        label_height = metrics.height() + 8
-        label_top = max(target.top(), box_rect.top() - label_height)
-        label_rect = QRectF(
-            box_rect.left(),
-            label_top,
-            label_width,
-            label_height,
-        )
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(self._class_color)
-        painter.drawRoundedRect(label_rect, 4, 4)
-        painter.setPen(QColor("#FFFFFF"))
-        painter.drawText(
-            label_rect.adjusted(8, 0, -8, 0),
-            Qt.AlignVCenter | Qt.AlignLeft,
-            label,
-        )
-
-        painter.setPen(QPen(QColor("#FFFFFF"), 1))
-        painter.setBrush(self._class_color)
-        size = self.HANDLE_SIZE
-        for point in self._handle_points().values():
-            painter.drawRect(
-                QRectF(
-                    point.x() - size / 2.0,
-                    point.y() - size / 2.0,
-                    size,
-                    size,
+        if self._multi_mode:
+            for index, annotation in enumerate(self._annotations):
+                if index == self._active_index:
+                    continue
+                name, color = self._annotation_style(annotation.class_id)
+                self._paint_box(
+                    painter,
+                    target,
+                    annotation.bbox,
+                    name,
+                    color,
+                    False,
                 )
+            if 0 <= self._active_index < len(self._annotations):
+                annotation = self._annotations[self._active_index]
+                name, color = self._annotation_style(annotation.class_id)
+                self._paint_box(
+                    painter,
+                    target,
+                    annotation.bbox,
+                    name,
+                    color,
+                    True,
+                )
+        elif self._bbox is not None:
+            self._paint_box(
+                painter,
+                target,
+                self._bbox,
+                self._class_name or "BBox",
+                self._class_color,
+                True,
             )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -251,6 +441,12 @@ class AnnotationCanvas(QWidget):
         if handle and self._bbox is not None:
             self._mode = "resize"
             self._handle = handle
+        elif self._multi_mode and self._hit_annotation(point) >= 0:
+            hit_index = self._hit_annotation(point)
+            if hit_index != self._active_index:
+                self.set_active_annotation(hit_index)
+                self._original_bbox = self._bbox
+            self._mode = "move"
         elif (
             self._bbox is not None
             and self._bbox_widget_rect().contains(point)
@@ -264,6 +460,15 @@ class AnnotationCanvas(QWidget):
                 self._start_image.x(),
                 self._start_image.y(),
             )
+            if self._multi_mode:
+                self._annotations.append(
+                    YoloAnnotation(
+                        class_id=self._current_class_id,
+                        bbox=self._bbox,
+                    )
+                )
+                self._active_index = len(self._annotations) - 1
+                self.active_annotation_changed.emit(self._active_index)
         self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -331,13 +536,51 @@ class AnnotationCanvas(QWidget):
                 width,
                 height,
             )
+        if (
+            self._multi_mode
+            and self._bbox is not None
+            and 0 <= self._active_index < len(self._annotations)
+        ):
+            annotation = self._annotations[self._active_index]
+            self._annotations[self._active_index] = YoloAnnotation(
+                class_id=annotation.class_id,
+                bbox=self._bbox,
+            )
+            self.annotations_changed.emit(tuple(self._annotations))
         self.bbox_changed.emit(self._bbox)
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._mode in {"draw", "move", "resize"}:
-            if self._bbox is not None and not self._bbox.is_valid():
-                self._bbox = None
+            minimum_size = (
+                0.01
+                if self._multi_mode and self._mode in {"move", "resize"}
+                else 3.0
+            )
+            if (
+                self._bbox is not None
+                and not self._bbox.is_valid(min_size=minimum_size)
+            ):
+                if (
+                    self._multi_mode
+                    and 0 <= self._active_index < len(self._annotations)
+                ):
+                    self._annotations.pop(self._active_index)
+                    self._active_index = min(
+                        self._active_index,
+                        len(self._annotations) - 1,
+                    )
+                    if self._active_index >= 0:
+                        annotation = self._annotations[self._active_index]
+                        self._bbox = annotation.bbox
+                        self._current_class_id = annotation.class_id
+                    else:
+                        self._bbox = None
+                    self.active_annotation_changed.emit(self._active_index)
+                else:
+                    self._bbox = None
+            if self._multi_mode:
+                self.annotations_changed.emit(tuple(self._annotations))
             self.bbox_changed.emit(self._bbox)
         self._mode = ""
         self._handle = ""

@@ -64,6 +64,79 @@ py -m venv .venv
 - `Ctrl+Z`: hoan tac thao tac ghi/xoa gan nhat.
 - `A` / `D`: xem anh truoc / sau ma chua xu ly.
 
+## Xem va sua dataset YOLO cu
+
+Chon che do `Xem / sua dataset YOLO cu`, sau do chon thu muc co
+`data.yaml`. Tool doc cac split trong YAML, ghep `images` voi `labels` va
+hien thi tat ca bbox/class da co.
+
+- Click mot box de chon object.
+- Keo box hoac 8 handle de move/resize.
+- Nhan `1` den `5` de doi class cua object dang chon.
+- Keo tren vung trong de them object moi.
+- `Backspace` xoa rieng object dang chon trong bo nho.
+- `Enter` backup label cu, ghi label moi theo kieu atomic va sang anh tiep.
+- `F` bo moi thay doi chua luu va tai lai snapshot nhan da co.
+- `Delete` chuyen ca anh va label vao
+  `<dataset>\.cvat_nhai_editor_archive`.
+- `A` / `D` chi chuyen anh khi thay doi hien tai da duoc `Enter` hoac `F`,
+  tranh mat nhan dang sua.
+- Thanh tien do co the click hoac keo nhanh toi bat ky anh nao. Trong luc
+  keo chi cap nhat so thu tu; anh chi duoc tai mot lan khi tha chuot.
+  `Left/Right` di mot anh, `PageUp/PageDown` nhay 100 anh. Thanh se tu quay
+  lai vi tri hien tai neu anh dang co thay doi chua `Enter` hoac `F`.
+
+Editor chi nhan YOLO bounding-box 5 cot:
+
+```text
+class_id center_x center_y width height
+```
+
+Nhan segmentation/polygon se bi tu choi va khong bi ghi de.
+BBox duong nhung nho hon 3 pixel van duoc nap; UI ve marker toi thieu de co
+the click/xoa, trong khi toa do YOLO goc duoc giu nguyen. Khi mot anh co
+nhieu object, box co dien tich lon nhat duoc chon mac dinh.
+
+Nut `Xuat yolo_f + class_f` chon mot thu muc goc rong va tao:
+
+```text
+<export>\yolo_f\images\<split>\*
+<export>\yolo_f\labels\<split>\*.txt
+<export>\class_f\<split>\<class_name>\*_boxNNN.jpg
+```
+
+Ca hai bo dung cung mot split moi theo ty le 70/20/10. Thuat toan can bang
+so object cua tung class thay vi chi chia tong so anh. Tat ca bbox cua cung
+mot anh, anh co cung family name va anh trung/noi dung gan trung theo visual
+fingerprint duoc khoa trong cung mot `leakage_group`, nen khong the nam dong
+thoi o train va val/test. `manifest.csv` luu split nguon, split moi va group
+de audit data leak.
+
+Moi bo co `data.yaml`, `manifest.csv` va `canbang.yaml`; `class_f` co them
+`stats.json`. Thu muc export bat buoc phai rong; ket qua duoc dung trong thu
+muc tam va chi duoc dua vao dich sau khi toan bo anh, nhan va crop thanh
+cong. Thu muc dich phai nam ngoai dataset nguon. Dataset YOLO nguon khong
+bi di chuyen hay sap xep lai.
+
+Khi export, ung dung hien dialog gom 4 giai doan, ten anh dang xu ly va thanh
+tien do. Nut `Huy an toan` dung tai diem an toan va xoa thu muc tam; dataset
+nguon khong bi thay doi va khong de lai bo export dang do.
+
+Truoc khi chon thu muc xuat, dialog `Cau hinh class_f` cho phep chinh margin
+tu `0%` den `50%` moi canh bbox. Bon crop ngau nhien duoc cap nhat truc tiep
+khi keo slider hoac sua o so; nut `Doi mau ngau nhien` chon cac bbox khac.
+Gia tri margin export duoc ghi nho rieng cho lan sau.
+
+Trong che do sua, `Tab` chon box ke tiep va `Shift+Tab` chon box truoc do,
+ke ca khi focus dang nam tren sidebar.
+
+Crop classification duoc mo rong theo `crop_padding`, sau do resize giu
+nguyen ty le va letterbox thanh dung `640x640` (mau nen RGB 114). Khong keo
+gian crop theo hai chieu nen hinh dang vat the khong bi meo.
+
+Nhan giu `A` hoac `D` de di chuyen lien tuc qua anh truoc/sau; tha phim de
+dung ngay.
+
 Anh bi xoa duoc di chuyen vao `work/archive/removed` thay vi xoa vinh vien.
 Dieu nay giu toc do thao tac nhanh nhung van cho phep `Ctrl+Z`.
 
