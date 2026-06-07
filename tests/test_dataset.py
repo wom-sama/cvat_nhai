@@ -9,7 +9,7 @@ from cvat_nhai.dataset import DatasetManager
 from cvat_nhai.dataset import DatasetError
 from cvat_nhai.models import BBox, DatasetPaths
 from cvat_nhai.schema import initialize_empty_datasets
-from cvat_nhai.utils import load_yaml, names_from_yaml
+from cvat_nhai.utils import atomic_write_yaml, load_yaml, names_from_yaml
 
 
 def make_manager(tmp_path: Path) -> tuple:
@@ -48,7 +48,11 @@ def test_annotation_writes_both_datasets_and_undoes(tmp_path: Path) -> None:
     assert result.classification_crop is not None
     assert result.classification_crop.exists()
     with Image.open(result.classification_crop) as crop:
-        assert crop.size == (192, 96)
+        assert crop.size == (640, 640)
+        corner = crop.getpixel((0, 0))
+        assert all(
+            abs(channel - 114) <= 3 for channel in corner
+        )
 
     with (classification / "manifest.csv").open(
         newline="",
@@ -89,6 +93,30 @@ def test_initialized_yaml_uses_five_classes(tmp_path: Path) -> None:
         tuple(names_from_yaml(load_yaml(classification / "data.yaml")))
         == CLASS_NAMES
     )
+    classification_yaml = load_yaml(classification / "data.yaml")
+    assert classification_yaml["image_size"] == [640, 640]
+    assert classification_yaml["resize_mode"] == "letterbox"
+    stats = load_yaml(classification / "stats.json")
+    assert stats["output_size"] == [640, 640]
+    assert stats["resize_mode"] == "letterbox"
+
+
+def test_existing_classification_yaml_gets_resize_metadata(
+    tmp_path: Path,
+) -> None:
+    manager, _, classification, _ = make_manager(tmp_path)
+    payload = load_yaml(classification / "data.yaml")
+    payload.pop("image_size")
+    payload.pop("resize_mode")
+    atomic_write_yaml(classification / "data.yaml", payload)
+    source = tmp_path / "existing_config.jpg"
+    Image.new("RGB", (80, 60), "orange").save(source)
+
+    manager.annotate(source, BBox(10, 10, 70, 50), 0, "train")
+
+    upgraded = load_yaml(classification / "data.yaml")
+    assert upgraded["image_size"] == [640, 640]
+    assert upgraded["resize_mode"] == "letterbox"
 
 
 def test_same_source_name_never_overwrites_outputs(tmp_path: Path) -> None:

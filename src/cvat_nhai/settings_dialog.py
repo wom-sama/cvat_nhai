@@ -59,12 +59,15 @@ class SettingsDialog(QDialog):
         self.padding_spin.setSingleStep(0.01)
         self.padding_spin.setDecimals(2)
         self.padding_spin.setValue(crop_padding)
+        self.padding_spin.setToolTip(
+            "Ty le mo rong moi canh cua bbox truoc khi letterbox 640x640"
+        )
 
         form = QFormLayout()
         form.addRow("YOLO detection:", self.detection_row)
         form.addRow("Classification crops:", self.classification_row)
         form.addRow("Safety archive:", self.archive_row)
-        form.addRow("Crop padding:", self.padding_spin)
+        form.addRow("Crop padding moi canh:", self.padding_spin)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel

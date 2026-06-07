@@ -14,9 +14,18 @@ from typing import Dict, Optional, Tuple
 from PIL import Image, ImageOps
 
 from .constants import CLASS_NAMES, IMAGE_EXTENSIONS, SPLITS
+from .image_ops import (
+    CLASSIFICATION_IMAGE_SIZE,
+    classification_crop,
+)
 from .journal import OperationJournal
 from .models import BBox, DatasetPaths, OperationResult
-from .schema import audit_schema, balance_payload, ensure_directory_layout
+from .schema import (
+    audit_schema,
+    balance_payload,
+    ensure_classification_resize_metadata,
+    ensure_directory_layout,
+)
 from .utils import (
     atomic_write_json,
     atomic_write_yaml,
@@ -221,6 +230,11 @@ class DatasetManager:
         stats = {
             "mode": "crop-box",
             "base_padding": self.crop_padding,
+            "output_size": [
+                CLASSIFICATION_IMAGE_SIZE,
+                CLASSIFICATION_IMAGE_SIZE,
+            ],
+            "resize_mode": "letterbox",
             "splits": {
                 split: {
                     "classes": dict(per_split[split]),
@@ -266,6 +280,11 @@ class DatasetManager:
         classes[name] = int(classes.get(name, 0)) + 1
         stats.setdefault("mode", "crop-box")
         stats["base_padding"] = self.crop_padding
+        stats["output_size"] = [
+            CLASSIFICATION_IMAGE_SIZE,
+            CLASSIFICATION_IMAGE_SIZE,
+        ]
+        stats["resize_mode"] = "letterbox"
         atomic_write_json(stats_path, stats)
 
         cls_balance_path = self.paths.classification_root / "canbang.yaml"
@@ -298,6 +317,9 @@ class DatasetManager:
         if class_id < 0 or class_id >= len(CLASS_NAMES):
             raise DatasetError("Select one of the five classes")
         self.validate_ready()
+        ensure_classification_resize_metadata(
+            self.paths.classification_root
+        )
         ensure_directory_layout(
             self.paths.detection_root,
             self.paths.classification_root,
@@ -328,8 +350,6 @@ class DatasetManager:
             )
             archive_path = self._archive_path(source, operation_id)
             yolo = box.to_yolo(width, height)
-            padded = box.padded(self.crop_padding, width, height)
-
             temp_dir = Path(
                 tempfile.mkdtemp(
                     prefix=".cvat_nhai_",
@@ -356,15 +376,17 @@ class DatasetManager:
                     ),
                     encoding="utf-8",
                 )
-                crop = image.crop(
-                    (
-                        int(round(padded.x1)),
-                        int(round(padded.y1)),
-                        int(round(padded.x2)),
-                        int(round(padded.y2)),
-                    )
+                crop = classification_crop(
+                    image,
+                    box,
+                    self.crop_padding,
                 )
-                crop.save(staged_crop, format="JPEG", quality=95)
+                crop.save(
+                    staged_crop,
+                    format="JPEG",
+                    quality=95,
+                    subsampling=0,
+                )
 
                 with self._lock:
                     for staged, final in (

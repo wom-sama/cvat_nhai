@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Dict
 
 from .constants import CLASS_NAMES, SPLITS
+from .image_ops import CLASSIFICATION_IMAGE_SIZE
 from .models import SchemaAudit
 from .utils import (
     atomic_write_json,
@@ -61,6 +62,7 @@ def initialize_empty_datasets(
         atomic_write_yaml(detection_yaml, detection_yaml_payload(detection_root))
     if not classification_yaml.exists():
         atomic_write_yaml(classification_yaml, classification_yaml_payload())
+    ensure_classification_resize_metadata(classification_root)
 
     manifest = classification_root / "manifest.csv"
     if not manifest.exists():
@@ -86,6 +88,11 @@ def initialize_empty_datasets(
             {
                 "mode": "crop-box",
                 "base_padding": 0.08,
+                "output_size": [
+                    CLASSIFICATION_IMAGE_SIZE,
+                    CLASSIFICATION_IMAGE_SIZE,
+                ],
+                "resize_mode": "letterbox",
                 "splits": {
                     split: {
                         "classes": {
@@ -111,6 +118,23 @@ def write_five_class_configs(
         classification_root / "data.yaml",
         classification_yaml_payload(),
     )
+
+
+def ensure_classification_resize_metadata(
+    classification_root: Path,
+) -> None:
+    path = classification_root / "data.yaml"
+    if not path.exists():
+        return
+    payload = load_yaml(path)
+    desired = classification_yaml_payload()
+    changed = False
+    for key in ("image_size", "resize_mode"):
+        if payload.get(key) != desired[key]:
+            payload[key] = desired[key]
+            changed = True
+    if changed:
+        atomic_write_yaml(path, payload)
 
 
 def balance_payload(

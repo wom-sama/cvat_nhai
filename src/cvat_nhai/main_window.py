@@ -2,7 +2,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QSettings, Qt, QThreadPool, Signal
+from PySide6.QtCore import QEvent, QSettings, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QImage, QImageReader, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
@@ -62,6 +62,8 @@ def load_qimage(path: Path) -> QImage:
 
 class MainWindow(QMainWindow):
     request_focus_canvas = Signal()
+    NAVIGATION_INITIAL_DELAY_MS = 260
+    NAVIGATION_REPEAT_MS = 140
 
     def __init__(self) -> None:
         super().__init__()
@@ -119,6 +121,12 @@ class MainWindow(QMainWindow):
         self.pending_loads = set()
         self.active_tasks = set()
         self.class_buttons: List[QPushButton] = []
+        self.navigation_direction = 0
+        self.navigation_timer = QTimer(self)
+        self.navigation_timer.setSingleShot(False)
+        self.navigation_timer.timeout.connect(
+            self._repeat_navigation
+        )
 
         self._build_ui()
         self._build_actions()
@@ -352,7 +360,7 @@ class MainWindow(QMainWindow):
         help_row = QHBoxLayout()
         self.help_text = QLabel(
             "Keo chuot: tao bbox   |   Keo trong khung: di chuyen   |   "
-            "Keo diem vuong: resize   |   Wheel: zoom   |   Space+drag: pan   |   A/D: anh truoc/sau"
+            "Keo diem vuong: resize   |   Wheel: zoom   |   Space+drag: pan   |   Giu A/D: anh truoc/sau"
         )
         self.help_text.setObjectName("muted")
         help_row.addWidget(self.help_text)
@@ -562,10 +570,10 @@ class MainWindow(QMainWindow):
             (
                 "Click box: chon object   |   Keo/resize: sua box   |   "
                 "Tab/Shift+Tab: doi box   |   Keo vung trong: them box   |   "
-                "Backspace: xoa box   |   A/D: anh truoc/sau"
+                "Backspace: xoa box   |   Giu A/D: anh truoc/sau"
                 if editing
                 else "Keo chuot: tao bbox   |   Keo trong khung: di chuyen   |   "
-                "Keo diem vuong: resize   |   Wheel: zoom   |   Space+drag: pan   |   A/D: anh truoc/sau"
+                "Keo diem vuong: resize   |   Wheel: zoom   |   Space+drag: pan   |   Giu A/D: anh truoc/sau"
             )
         )
         self._configure_class_buttons(CLASS_NAMES)
@@ -1238,19 +1246,66 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Khong co thao tac de hoan tac", 3000)
 
-    def navigate(self, delta: int) -> None:
+    def navigate(self, delta: int) -> bool:
         if self.busy or not self.images:
-            return
+            return False
         if self.mode == "edit" and self._editor_is_dirty():
             self.statusBar().showMessage(
                 "Nhan Enter de luu hoac F de bo thay doi truoc khi chuyen anh",
                 5000,
             )
-            return
+            return False
         new_index = self.current_index + delta
         if 0 <= new_index < len(self.images):
             self.current_index = new_index
             self.show_current()
+            return True
+        return False
+
+    def _start_continuous_navigation(self, direction: int) -> None:
+        if direction not in (-1, 1):
+            return
+        if (
+            self.navigation_timer.isActive()
+            and self.navigation_direction == direction
+        ):
+            return
+        self.navigation_timer.stop()
+        self.navigation_direction = direction
+        if not self.navigate(direction):
+            self.navigation_direction = 0
+            return
+        self.navigation_timer.setInterval(
+            self.NAVIGATION_INITIAL_DELAY_MS
+        )
+        self.navigation_timer.start()
+
+    def _repeat_navigation(self) -> None:
+        if not self.navigate(self.navigation_direction):
+            self._stop_continuous_navigation()
+            return
+        if (
+            self.navigation_timer.interval()
+            != self.NAVIGATION_REPEAT_MS
+        ):
+            self.navigation_timer.setInterval(
+                self.NAVIGATION_REPEAT_MS
+            )
+
+    def _stop_continuous_navigation(
+        self,
+        direction: Optional[int] = None,
+    ) -> None:
+        timer = getattr(self, "navigation_timer", None)
+        if timer is None:
+            return
+        if (
+            direction is not None
+            and direction != getattr(self, "navigation_direction", 0)
+        ):
+            return
+        timer.stop()
+        self.navigation_direction = 0
 
     def seek_to_index(self, index: int) -> None:
         if self.mode != "edit" or self.busy or not self.images:
@@ -1279,6 +1334,8 @@ class MainWindow(QMainWindow):
 
     def _set_busy(self, busy: bool, message: str = "") -> None:
         self.busy = busy
+        if busy:
+            self._stop_continuous_navigation()
         self.commit_button.setEnabled(not busy)
         self.delete_button.setEnabled(not busy)
         self.reset_button.setEnabled(not busy)
@@ -1418,14 +1475,22 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Loi", message)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._stop_continuous_navigation()
         self.settings.sync()
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        key = event.key()
+        if key in (Qt.Key_A, Qt.Key_D):
+            if not event.isAutoRepeat():
+                self._start_continuous_navigation(
+                    -1 if key == Qt.Key_A else 1
+                )
+            event.accept()
+            return
         if event.isAutoRepeat():
             super().keyPressEvent(event)
             return
-        key = event.key()
         if key == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
             if self.mode != "edit":
                 self.undo_latest()
@@ -1447,16 +1512,24 @@ class MainWindow(QMainWindow):
             self.reset_annotation()
             event.accept()
             return
-        if key == Qt.Key_A:
-            self.navigate(-1)
-            event.accept()
-            return
-        if key == Qt.Key_D:
-            self.navigate(1)
-            event.accept()
-            return
         if key == Qt.Key_Backspace and self.mode == "edit":
             self.remove_active_box()
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        key = event.key()
+        if key in (Qt.Key_A, Qt.Key_D):
+            if not event.isAutoRepeat():
+                self._stop_continuous_navigation(
+                    -1 if key == Qt.Key_A else 1
+                )
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def event(self, event) -> bool:  # type: ignore[no-untyped-def]
+        if event.type() == QEvent.WindowDeactivate:
+            self._stop_continuous_navigation()
+        return super().event(event)

@@ -243,7 +243,7 @@ def test_export_rebalanced_datasets_uses_edited_labels(
     assert len(crops) == 2
     a_crop = next(path for path in crops if path.name == "a_box000.jpg")
     with Image.open(a_crop) as crop:
-        assert crop.size == (100, 60)
+        assert crop.size == (640, 640)
     with (classification / "manifest.csv").open(
         newline="",
         encoding="utf-8",
@@ -257,6 +257,12 @@ def test_export_rebalanced_datasets_uses_edited_labels(
     assert tuple(
         names_from_yaml(load_yaml(detection / "data.yaml"))
     ) == NAMES
+    classification_yaml = load_yaml(classification / "data.yaml")
+    assert classification_yaml["image_size"] == [640, 640]
+    assert classification_yaml["resize_mode"] == "letterbox"
+    classification_stats = load_yaml(classification / "stats.json")
+    assert classification_stats["output_size"] == [640, 640]
+    assert classification_stats["resize_mode"] == "letterbox"
     assert len(list(detection.rglob("*.txt"))) == 2
     assert all(
         line.startswith("2 ")

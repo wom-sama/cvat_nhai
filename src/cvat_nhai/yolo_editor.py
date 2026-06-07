@@ -15,6 +15,10 @@ from typing import Dict, List, Sequence, Tuple
 from PIL import Image, ImageOps
 
 from .constants import IMAGE_EXTENSIONS, SPLITS
+from .image_ops import (
+    CLASSIFICATION_IMAGE_SIZE,
+    classification_crop,
+)
 from .journal import OperationJournal
 from .models import (
     BBox,
@@ -509,6 +513,11 @@ def _classification_yaml(class_names: Sequence[str]) -> dict:
         "test": "test",
         "nc": len(class_names),
         "class_name_mode": "raw",
+        "image_size": [
+            CLASSIFICATION_IMAGE_SIZE,
+            CLASSIFICATION_IMAGE_SIZE,
+        ],
+        "resize_mode": "letterbox",
         "names": {
             index: str(name) for index, name in enumerate(class_names)
         },
@@ -988,20 +997,17 @@ def export_rebalanced_datasets(
                         object_index,
                     )
                     output_path = output_dir / output_name
-                    box = annotation.bbox.padded(
+                    crop = classification_crop(
+                        image,
+                        annotation.bbox,
                         crop_padding,
-                        source.width,
-                        source.height,
                     )
-                    crop = image.crop(
-                        (
-                            int(round(box.x1)),
-                            int(round(box.y1)),
-                            int(round(box.x2)),
-                            int(round(box.y2)),
-                        )
+                    crop.save(
+                        output_path,
+                        format="JPEG",
+                        quality=95,
+                        subsampling=0,
                     )
-                    crop.save(output_path, format="JPEG", quality=95)
                     counts[annotation.class_id] += 1
                     split_class_counts[split][annotation.class_id] += 1
                     classification_manifest_rows.append(
@@ -1091,6 +1097,11 @@ def export_rebalanced_datasets(
             {
                 "mode": "crop-box",
                 "base_padding": float(crop_padding),
+                "output_size": [
+                    CLASSIFICATION_IMAGE_SIZE,
+                    CLASSIFICATION_IMAGE_SIZE,
+                ],
+                "resize_mode": "letterbox",
                 **_split_metadata(),
                 "source_groups": len(groups),
                 "splits": {

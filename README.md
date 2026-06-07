@@ -121,6 +121,13 @@ bi di chuyen hay sap xep lai.
 Trong che do sua, `Tab` chon box ke tiep va `Shift+Tab` chon box truoc do,
 ke ca khi focus dang nam tren sidebar.
 
+Crop classification duoc mo rong theo `crop_padding`, sau do resize giu
+nguyen ty le va letterbox thanh dung `640x640` (mau nen RGB 114). Khong keo
+gian crop theo hai chieu nen hinh dang vat the khong bi meo.
+
+Nhan giu `A` hoac `D` de di chuyen lien tuc qua anh truoc/sau; tha phim de
+dung ngay.
+
 Anh bi xoa duoc di chuyen vao `work/archive/removed` thay vi xoa vinh vien.
 Dieu nay giu toc do thao tac nhanh nhung van cho phep `Ctrl+Z`.
 

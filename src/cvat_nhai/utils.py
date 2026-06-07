@@ -9,6 +9,7 @@ from typing import Any, Iterable, List
 import yaml
 
 from .constants import CLASS_NAMES
+from .image_ops import CLASSIFICATION_IMAGE_SIZE
 
 
 def safe_stem(value: str) -> str:
@@ -100,6 +101,11 @@ def classification_yaml_payload() -> dict:
         "nc": len(CLASS_NAMES),
         "class_name_mode": "raw",
         "canbang_yaml": "canbang.yaml",
+        "image_size": [
+            CLASSIFICATION_IMAGE_SIZE,
+            CLASSIFICATION_IMAGE_SIZE,
+        ],
+        "resize_mode": "letterbox",
         "names": {index: name for index, name in enumerate(CLASS_NAMES)},
     }
 

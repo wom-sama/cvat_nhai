@@ -55,6 +55,51 @@ def test_scan_keeps_workers_alive_and_displays_first_image(
     )[0]
 
 
+def test_holding_a_or_d_continuously_navigates_and_stops_on_release(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "navigation"
+    source.mkdir()
+    for index in range(8):
+        Image.new("RGB", (80, 60), (index * 20, 90, 120)).save(
+            source / "image_{:02d}.jpg".format(index)
+        )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.source_edit.setText(str(source))
+    window.scan_source()
+    qtbot.waitUntil(
+        lambda: (
+            len(window.images) == 8
+            and not window.active_tasks
+            and window.current_index == 0
+        ),
+        timeout=5000,
+    )
+
+    qtbot.keyPress(window, Qt.Key_D)
+    qtbot.waitUntil(
+        lambda: window.current_index >= 3,
+        timeout=1500,
+    )
+    qtbot.keyRelease(window, Qt.Key_D)
+    stopped_index = window.current_index
+    qtbot.wait(400)
+    assert window.current_index == stopped_index
+    assert not window.navigation_timer.isActive()
+
+    qtbot.keyPress(window, Qt.Key_A)
+    qtbot.waitUntil(
+        lambda: window.current_index < stopped_index,
+        timeout=1000,
+    )
+    qtbot.keyRelease(window, Qt.Key_A)
+    assert not window.navigation_timer.isActive()
+
+
 def test_destination_root_creates_both_five_class_datasets(
     qtbot,
     tmp_path: Path,
