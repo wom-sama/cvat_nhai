@@ -23,6 +23,23 @@ def test_canvas_draw_reset_and_zoom(qtbot) -> None:
     assert canvas.bbox is None
 
 
+def test_canvas_keeps_image_visible_while_loading_replacement(qtbot) -> None:
+    canvas = AnnotationCanvas()
+    canvas.resize(800, 600)
+    canvas.set_image(QImage(400, 300, QImage.Format_RGB32))
+    canvas.show()
+    qtbot.addWidget(canvas)
+
+    canvas.set_loading("Dang tai next.jpg...")
+
+    assert canvas.is_loading
+    assert canvas.image_size == (400, 300)
+    replacement = QImage(640, 480, QImage.Format_RGB32)
+    canvas.set_image(replacement)
+    assert not canvas.is_loading
+    assert canvas.image_size == (640, 480)
+
+
 def test_canvas_multiple_annotations_select_class_and_remove(qtbot) -> None:
     canvas = AnnotationCanvas()
     canvas.resize(800, 600)

@@ -49,6 +49,7 @@ class AnnotationCanvas(QWidget):
         self._start_widget = QPointF()
         self._start_image = QPointF()
         self._original_bbox: Optional[BBox] = None
+        self._loading_message = ""
         self.setCursor(Qt.CrossCursor)
 
     @property
@@ -67,9 +68,14 @@ class AnnotationCanvas(QWidget):
     def image_size(self) -> Tuple[int, int]:
         return self._image.width(), self._image.height()
 
+    @property
+    def is_loading(self) -> bool:
+        return bool(self._loading_message)
+
     def set_image(self, image: QImage) -> None:
         self._image = image
         self._pixmap = QPixmap.fromImage(image)
+        self._loading_message = ""
         self._bbox = None
         self._annotations = []
         self._active_index = -1
@@ -80,10 +86,19 @@ class AnnotationCanvas(QWidget):
     def clear_image(self) -> None:
         self._image = QImage()
         self._pixmap = QPixmap()
+        self._loading_message = ""
         self._bbox = None
         self._annotations = []
         self._active_index = -1
         self._multi_mode = False
+        self.update()
+
+    def set_loading(self, message: str = "Dang tai anh...") -> None:
+        self._loading_message = message
+        self.update()
+
+    def clear_loading(self) -> None:
+        self._loading_message = ""
         self.update()
 
     def set_bbox(self, bbox: Optional[BBox]) -> None:
@@ -419,8 +434,27 @@ class AnnotationCanvas(QWidget):
                 True,
             )
 
+        if self._loading_message:
+            painter.fillRect(self.rect(), QColor(2, 6, 23, 150))
+            card_width = min(420.0, max(260.0, self.width() - 48.0))
+            card = QRectF(
+                (self.width() - card_width) / 2.0,
+                (self.height() - 82.0) / 2.0,
+                card_width,
+                82.0,
+            )
+            painter.setPen(QPen(QColor("#475569"), 1))
+            painter.setBrush(QColor("#111827"))
+            painter.drawRoundedRect(card, 9, 9)
+            painter.setPen(QColor("#F8FAFC"))
+            font = QFont()
+            font.setPointSize(12)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(card, Qt.AlignCenter, self._loading_message)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self._image.isNull():
+        if self._image.isNull() or self._loading_message:
             return
         point = event.position()
         if event.button() == Qt.MiddleButton or (

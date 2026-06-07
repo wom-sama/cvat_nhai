@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .busy_overlay import BusyOverlay
 from .canvas import AnnotationCanvas
 from .constants import (
     APP_NAME,
@@ -392,6 +393,7 @@ class MainWindow(QMainWindow):
         status = QStatusBar()
         self.setStatusBar(status)
         self.statusBar().showMessage("San sang")
+        self.busy_overlay = BusyOverlay(root)
 
     def _build_actions(self) -> None:
         open_action = QAction(self)
@@ -835,26 +837,36 @@ class MainWindow(QMainWindow):
                 self._bbox_changed(None)
             return
         if key in self.pending_loads:
+            if display:
+                self.canvas.set_loading(
+                    "Dang tai {}...".format(path.name)
+                )
             return
         self.pending_loads.add(key)
         if display:
-            self.canvas.clear_image()
+            self.canvas.set_loading(
+                "Dang tai {}...".format(path.name)
+            )
             self.statusBar().showMessage("Dang tai {}...".format(path.name))
         task = FunctionTask(load_qimage, path)
         task.signals.succeeded.connect(
-            lambda image, value=path, show=display: self._image_loaded(
+            lambda image, value=path: self._image_loaded(
                 value,
                 image,
-                show,
             )
         )
-        task.signals.failed.connect(self._background_failed)
+        task.signals.failed.connect(
+            lambda traceback_text, value=path: self._image_load_failed(
+                value,
+                traceback_text,
+            )
+        )
         task.signals.finished.connect(
             lambda value=key: self.pending_loads.discard(value)
         )
         self._start_task(task)
 
-    def _image_loaded(self, path: Path, result: object, display: bool) -> None:
+    def _image_loaded(self, path: Path, result: object) -> None:
         image = result
         if not isinstance(image, QImage):
             return
@@ -863,7 +875,7 @@ class MainWindow(QMainWindow):
         self.image_cache.move_to_end(key)
         while len(self.image_cache) > 8:
             self.image_cache.popitem(last=False)
-        if display and self.current_path == path:
+        if self.current_path == path:
             self.canvas.set_image(image)
             if self.mode == "edit":
                 self._load_editor_annotations(path, image)
@@ -871,6 +883,15 @@ class MainWindow(QMainWindow):
                 "{} x {} px".format(image.width(), image.height()),
                 3000,
             )
+
+    def _image_load_failed(
+        self,
+        path: Path,
+        traceback_text: str,
+    ) -> None:
+        if self.current_path == path:
+            self.canvas.clear_loading()
+        self._background_failed(traceback_text)
 
     def _load_editor_annotations(self, path: Path, image: QImage) -> None:
         sample = self.editor_samples_by_path.get(path)
@@ -1223,7 +1244,10 @@ class MainWindow(QMainWindow):
         task.signals.succeeded.connect(self._export_finished)
         task.signals.failed.connect(self._export_failed)
         task.signals.finished.connect(self._export_task_finished)
+        self._ensure_window_visible()
         dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
         QTimer.singleShot(
             0,
             lambda value=task: self._start_task(value),
@@ -1452,6 +1476,19 @@ class MainWindow(QMainWindow):
         self.remove_box_button.setEnabled(not busy)
         if message:
             self.statusBar().showMessage(message)
+        if busy:
+            self._ensure_window_visible()
+            self.busy_overlay.show_message(message)
+        else:
+            self.busy_overlay.hide()
+
+    def _ensure_window_visible(self) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        elif not self.isVisible():
+            self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _update_schema_status(self) -> None:
         if self.mode == "edit":
@@ -1590,6 +1627,12 @@ class MainWindow(QMainWindow):
         self._stop_continuous_navigation()
         self.settings.sync()
         super().closeEvent(event)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        overlay = getattr(self, "busy_overlay", None)
+        if overlay is not None:
+            overlay.setGeometry(self.centralWidget().rect())
 
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         key = event.key()

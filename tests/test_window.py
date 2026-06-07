@@ -3,6 +3,7 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QImage
 
 import cvat_nhai.main_window as main_window_module
 from cvat_nhai.main_window import MainWindow
@@ -105,6 +106,81 @@ def test_holding_a_or_d_continuously_navigates_and_stops_on_release(
     )
     qtbot.keyRelease(window, Qt.Key_A)
     assert not window.navigation_timer.isActive()
+
+
+def test_enter_keeps_window_visible_and_shows_busy_progress(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "current.jpg"
+    Image.new("RGB", (120, 80), "green").save(source)
+
+    class SlowManager:
+        @staticmethod
+        def annotate(path, bbox, class_id, requested_split):
+            time.sleep(0.25)
+            return type(
+                "Result",
+                (),
+                {"action": "annotate", "split": "train"},
+            )()
+
+    monkeypatch.setattr(
+        main_window_module,
+        "audit_schema",
+        lambda *args: type("Audit", (), {"ready": True})(),
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    window.manager = SlowManager()
+    window.images = [source]
+    window.current_path = source
+    window.current_index = 0
+    window.selected_class = 0
+    window.canvas.set_image(QImage(120, 80, QImage.Format_RGB32))
+    window.canvas.set_bbox(BBox(10, 10, 100, 70))
+
+    heartbeats = []
+    heartbeat = QTimer()
+    heartbeat.setInterval(10)
+    heartbeat.timeout.connect(lambda: heartbeats.append(1))
+    heartbeat.start()
+    qtbot.keyClick(window, Qt.Key_Return)
+
+    qtbot.waitUntil(lambda: window.busy_overlay.isVisible(), timeout=1000)
+    assert window.isVisible()
+    assert window.busy
+    assert window.busy_overlay.progress_bar.maximum() == 0
+    assert "Dang ghi hai dataset" in window.busy_overlay.detail_label.text()
+    qtbot.waitUntil(lambda: not window.busy, timeout=3000)
+    heartbeat.stop()
+    assert len(heartbeats) >= 3
+    assert window.isVisible()
+    assert not window.busy_overlay.isVisible()
+
+
+def test_prefetched_image_is_displayed_if_it_becomes_current(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "prefetched.jpg"
+    Image.new("RGB", (320, 180), "orange").save(path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.current_path = path
+    window.canvas.set_image(QImage(40, 30, QImage.Format_RGB32))
+    window.canvas.set_loading("Dang tai prefetched.jpg...")
+
+    prefetched = QImage(320, 180, QImage.Format_RGB32)
+    window._image_loaded(path, prefetched)
+
+    assert window.canvas.image_size == (320, 180)
+    assert not window.canvas.is_loading
 
 
 def test_destination_root_creates_both_five_class_datasets(
