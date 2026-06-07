@@ -122,6 +122,11 @@ Khi export, ung dung hien dialog gom 4 giai doan, ten anh dang xu ly va thanh
 tien do. Nut `Huy an toan` dung tai diem an toan va xoa thu muc tam; dataset
 nguon khong bi thay doi va khong de lai bo export dang do.
 
+Truoc khi chon thu muc xuat, dialog `Cau hinh class_f` cho phep chinh margin
+tu `0%` den `50%` moi canh bbox. Bon crop ngau nhien duoc cap nhat truc tiep
+khi keo slider hoac sua o so; nut `Doi mau ngau nhien` chon cac bbox khac.
+Gia tri margin export duoc ghi nho rieng cho lan sau.
+
 Trong che do sua, `Tab` chon box ke tiep va `Shift+Tab` chon box truoc do,
 ke ca khi focus dang nam tren sidebar.
 

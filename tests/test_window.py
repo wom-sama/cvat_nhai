@@ -137,6 +137,7 @@ def test_export_dialog_reports_progress_without_blocking_ui(
 ) -> None:
     destination = tmp_path / "export"
     destination.mkdir()
+    used_padding = []
 
     def slow_export(
         index,
@@ -145,6 +146,7 @@ def test_export_dialog_reports_progress_without_blocking_ui(
         progress_callback=None,
         cancel_event=None,
     ):
+        used_padding.append(crop_padding)
         for value in range(1, 8):
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("Export da bi huy an toan")
@@ -169,6 +171,21 @@ def test_export_dialog_reports_progress_without_blocking_ui(
         main_window_module,
         "export_rebalanced_datasets",
         slow_export,
+    )
+
+    class FakeExportSettingsDialog:
+        Accepted = 1
+
+        def __init__(self, preview_items, initial_padding, parent=None):
+            self.crop_padding = 0.23
+
+        def exec(self):
+            return self.Accepted
+
+    monkeypatch.setattr(
+        main_window_module,
+        "ExportSettingsDialog",
+        FakeExportSettingsDialog,
     )
     monkeypatch.setattr(
         main_window_module.QFileDialog,
@@ -213,6 +230,9 @@ def test_export_dialog_reports_progress_without_blocking_ui(
     qtbot.waitUntil(lambda: not window.busy, timeout=3000)
     heartbeat.stop()
     assert window.export_progress_dialog is None
+    assert used_padding == [0.23]
+    assert window.export_crop_padding == 0.23
+    assert float(window.settings.value("datasets/export_crop_padding")) == 0.23
 
 
 def test_yolo_editor_mode_loads_resets_saves_and_deletes(

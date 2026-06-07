@@ -1,7 +1,9 @@
 from collections import OrderedDict
 from pathlib import Path
+import random
 from typing import List, Optional
 
+from PIL import Image, ImageOps
 from PySide6.QtCore import QEvent, QSettings, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QImage, QImageReader, QKeySequence
 from PySide6.QtWidgets import (
@@ -34,6 +36,10 @@ from .constants import (
 )
 from .dataset import DatasetError, DatasetManager
 from .export_progress_dialog import ExportProgressDialog
+from .export_settings_dialog import (
+    ExportPreviewItem,
+    ExportSettingsDialog,
+)
 from .migration import apply_migration
 from .models import BBox, DatasetPaths, MigrationReport
 from .scanner import scan_images
@@ -97,6 +103,12 @@ class MainWindow(QMainWindow):
         )
         self.crop_padding = float(
             self.settings.value("datasets/crop_padding", 0.08)
+        )
+        self.export_crop_padding = float(
+            self.settings.value(
+                "datasets/export_crop_padding",
+                self.crop_padding,
+            )
         )
         output_root_value = str(
             self.settings.value("datasets/output_root", "")
@@ -1169,6 +1181,18 @@ class MainWindow(QMainWindow):
                 5000,
             )
             return
+        preview_dialog = ExportSettingsDialog(
+            self._load_export_preview_items(),
+            self.export_crop_padding,
+            self,
+        )
+        if preview_dialog.exec() != preview_dialog.Accepted:
+            return
+        self.export_crop_padding = preview_dialog.crop_padding
+        self.settings.setValue(
+            "datasets/export_crop_padding",
+            self.export_crop_padding,
+        )
         destination = QFileDialog.getExistingDirectory(
             self,
             "Chon thu muc rong de tao yolo_f + class_f",
@@ -1188,7 +1212,7 @@ class MainWindow(QMainWindow):
             export_rebalanced_datasets,
             self.editor_index,
             path,
-            self.crop_padding,
+            self.export_crop_padding,
             report_progress=True,
         )
         self.export_task = task
@@ -1204,6 +1228,52 @@ class MainWindow(QMainWindow):
             0,
             lambda value=task: self._start_task(value),
         )
+
+    def _load_export_preview_items(
+        self,
+        maximum: int = 12,
+    ) -> List[ExportPreviewItem]:
+        if self.editor_index is None or maximum <= 0:
+            return []
+        samples = list(self.editor_index.samples)
+        random.SystemRandom().shuffle(samples)
+        if self.current_path is not None:
+            samples.sort(
+                key=lambda sample: sample.image_path != self.current_path
+            )
+
+        result = []
+        inspection_limit = max(200, maximum * 25)
+        for sample in samples[:inspection_limit]:
+            if len(result) >= maximum:
+                break
+            if not sample.image_path.exists():
+                continue
+            try:
+                with Image.open(sample.image_path) as opened:
+                    image = ImageOps.exif_transpose(opened).convert("RGB")
+                annotations = read_yolo_annotations(
+                    sample.label_path,
+                    image.width,
+                    image.height,
+                    len(self.editor_index.class_names),
+                )
+            except (OSError, YoloEditorError):
+                continue
+            if not annotations:
+                continue
+            annotation = random.SystemRandom().choice(annotations)
+            result.append(
+                ExportPreviewItem(
+                    image=image,
+                    bbox=annotation.bbox,
+                    image_name=sample.image_path.name,
+                    class_name=self.editor_index.class_names[
+                        annotation.class_id
+                    ],
+                )
+            )
+        return result
 
     def _export_finished(self, result: object) -> None:
         if self.export_progress_dialog is not None:
