@@ -93,6 +93,9 @@ class_id center_x center_y width height
 ```
 
 Nhan segmentation/polygon se bi tu choi va khong bi ghi de.
+BBox duong nhung nho hon 3 pixel van duoc nap; UI ve marker toi thieu de co
+the click/xoa, trong khi toa do YOLO goc duoc giu nguyen. Khi mot anh co
+nhieu object, box co dien tich lon nhat duoc chon mac dinh.
 
 Nut `Xuat classification folder tu nhan da sua` tao:
 

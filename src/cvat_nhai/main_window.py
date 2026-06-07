@@ -845,9 +845,17 @@ class MainWindow(QMainWindow):
             self._show_error(str(error))
             return
         self.editor_original_annotations = annotations
-        self.canvas.set_annotations(annotations, 0)
+        active_index = (
+            max(
+                range(len(annotations)),
+                key=lambda index: annotations[index].bbox.area,
+            )
+            if annotations
+            else 0
+        )
+        self.canvas.set_annotations(annotations, active_index)
         if annotations:
-            self._select_class_ui(annotations[0].class_id)
+            self._select_class_ui(annotations[active_index].class_id)
         else:
             self._select_class_ui(0)
         self._update_object_status()
@@ -920,10 +928,23 @@ class MainWindow(QMainWindow):
         if self.busy:
             return
         if self.mode == "edit":
-            self.canvas.set_annotations(self.editor_original_annotations, 0)
+            active_index = (
+                max(
+                    range(len(self.editor_original_annotations)),
+                    key=lambda index: self.editor_original_annotations[
+                        index
+                    ].bbox.area,
+                )
+                if self.editor_original_annotations
+                else 0
+            )
+            self.canvas.set_annotations(
+                self.editor_original_annotations,
+                active_index,
+            )
             if self.editor_original_annotations:
                 self._select_class_ui(
-                    self.editor_original_annotations[0].class_id
+                    self.editor_original_annotations[active_index].class_id
                 )
             self._update_object_status()
             self.statusBar().showMessage(

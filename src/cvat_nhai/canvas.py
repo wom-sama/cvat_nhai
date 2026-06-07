@@ -22,6 +22,7 @@ class AnnotationCanvas(QWidget):
     active_annotation_changed = Signal(int)
 
     HANDLE_SIZE = 9.0
+    MIN_VISIBLE_BOX_SIZE = 12.0
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -250,8 +251,21 @@ class AnnotationCanvas(QWidget):
         )
         return QRectF(top_left, bottom_right).normalized()
 
+    def _visible_bbox_widget_rect(self, bbox: BBox) -> QRectF:
+        rect = self._bbox_widget_rect(bbox)
+        width = max(rect.width(), self.MIN_VISIBLE_BOX_SIZE)
+        height = max(rect.height(), self.MIN_VISIBLE_BOX_SIZE)
+        return QRectF(
+            rect.center().x() - width / 2.0,
+            rect.center().y() - height / 2.0,
+            width,
+            height,
+        )
+
     def _handle_points(self) -> dict:
-        rect = self._bbox_widget_rect()
+        if self._bbox is None:
+            return {}
+        rect = self._visible_bbox_widget_rect(self._bbox)
         if rect.isNull():
             return {}
         center = rect.center()
@@ -278,9 +292,9 @@ class AnnotationCanvas(QWidget):
 
     def _hit_annotation(self, point: QPointF) -> int:
         for index in range(len(self._annotations) - 1, -1, -1):
-            if self._bbox_widget_rect(
+            if self._visible_bbox_widget_rect(
                 self._annotations[index].bbox
-            ).contains(point):
+            ).adjusted(-4, -4, 4, 4).contains(point):
                 return index
         return -1
 
@@ -304,7 +318,7 @@ class AnnotationCanvas(QWidget):
         color: QColor,
         active: bool,
     ) -> None:
-        box_rect = self._bbox_widget_rect(bbox)
+        box_rect = self._visible_bbox_widget_rect(bbox)
         pen = QPen(color, 2.8 if active else 1.8)
         pen.setCosmetic(True)
         if not active:
@@ -538,7 +552,15 @@ class AnnotationCanvas(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._mode in {"draw", "move", "resize"}:
-            if self._bbox is not None and not self._bbox.is_valid():
+            minimum_size = (
+                0.01
+                if self._multi_mode and self._mode in {"move", "resize"}
+                else 3.0
+            )
+            if (
+                self._bbox is not None
+                and not self._bbox.is_valid(min_size=minimum_size)
+            ):
                 if (
                     self._multi_mode
                     and 0 <= self._active_index < len(self._annotations)

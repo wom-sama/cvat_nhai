@@ -195,6 +195,23 @@ def read_yolo_annotations(
                     line_number,
                 )
             )
+        raw_x1 = (center_x - width / 2.0) * image_width
+        raw_y1 = (center_y - height / 2.0) * image_height
+        raw_x2 = (center_x + width / 2.0) * image_width
+        raw_y2 = (center_y + height / 2.0) * image_height
+        rounding_tolerance = 0.001
+        if (
+            raw_x1 < -rounding_tolerance
+            or raw_y1 < -rounding_tolerance
+            or raw_x2 > image_width + rounding_tolerance
+            or raw_y2 > image_height + rounding_tolerance
+        ):
+            raise YoloEditorError(
+                "{}:{} bbox vuot ngoai bien anh".format(
+                    label_path,
+                    line_number,
+                )
+            )
         bbox = BBox.from_yolo(
             center_x,
             center_y,
@@ -202,10 +219,14 @@ def read_yolo_annotations(
             height,
             image_width,
             image_height,
+            clamp_box=False,
         )
-        if not bbox.is_valid():
+        if not bbox.is_valid(min_size=0.01):
             raise YoloEditorError(
-                "{}:{} bbox qua nho".format(label_path, line_number)
+                "{}:{} bbox co kich thuoc bang 0".format(
+                    label_path,
+                    line_number,
+                )
             )
         annotations.append(YoloAnnotation(class_id=class_id, bbox=bbox))
     return annotations
@@ -226,6 +247,8 @@ def serialize_yolo_annotations(
         center_x, center_y, width, height = annotation.bbox.to_yolo(
             image_width,
             image_height,
+            min_size=0.01,
+            clamp_box=False,
         )
         lines.append(
             "{} {:.6f} {:.6f} {:.6f} {:.6f}".format(

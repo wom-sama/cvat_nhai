@@ -76,3 +76,31 @@ def test_bbox_render_has_no_interior_overlay(qtbot) -> None:
         int(round(center.y())),
     )
     assert interior_color == QColor("#718096")
+
+
+def test_tiny_bbox_has_visible_click_target_without_geometry_change(
+    qtbot,
+) -> None:
+    canvas = AnnotationCanvas()
+    canvas.resize(800, 600)
+    canvas.set_image(QImage(640, 640, QImage.Format_RGB32))
+    tiny = YoloAnnotation(0, BBox(20.0, 90.0, 21.4, 91.4))
+    large = YoloAnnotation(1, BBox(100, 100, 500, 500))
+    canvas.set_class_catalog(("tiny", "large"), ("#22C55E", "#EF4444"))
+    canvas.set_annotations((tiny, large), active_index=1)
+    canvas.show()
+    qtbot.addWidget(canvas)
+    qtbot.waitExposed(canvas)
+
+    target = canvas._image_to_widget(QPoint(21, 91))
+    qtbot.mouseClick(
+        canvas,
+        Qt.LeftButton,
+        pos=QPoint(round(target.x()), round(target.y())),
+    )
+
+    assert canvas.active_index == 0
+    assert canvas.annotations[0].bbox == tiny.bbox
+    visible = canvas._visible_bbox_widget_rect(tiny.bbox)
+    assert visible.width() >= canvas.MIN_VISIBLE_BOX_SIZE
+    assert visible.height() >= canvas.MIN_VISIBLE_BOX_SIZE

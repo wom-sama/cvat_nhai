@@ -185,3 +185,56 @@ def test_yolo_editor_mode_loads_resets_saves_and_deletes(
         ),
         timeout=5000,
     )
+
+
+def test_yolo_editor_loads_tiny_box_and_selects_largest(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "tiny_yolo"
+    for split in ("train", "val", "test"):
+        (root / "images" / split).mkdir(parents=True)
+        (root / "labels" / split).mkdir(parents=True)
+    atomic_write_yaml(
+        root / "data.yaml",
+        {
+            "path": str(root),
+            "train": "images/train",
+            "val": "images/val",
+            "test": "images/test",
+            "nc": 5,
+            "names": [
+                "c0",
+                "c1",
+                "c2",
+                "c3",
+                "c4",
+            ],
+        },
+    )
+    image = root / "images" / "train" / "tiny.jpg"
+    Image.new("RGB", (640, 640), "green").save(image)
+    (root / "labels" / "train" / "tiny.txt").write_text(
+        "4 0.032531 0.144258 0.002156 0.002172\n"
+        "4 0.514641 0.505453 0.970719 0.715906\n",
+        encoding="utf-8",
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.mode_combo.setCurrentIndex(1)
+    window.source_edit.setText(str(root))
+    window.scan_source()
+
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == image
+            and len(window.canvas.annotations) == 2
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert window.canvas.active_index == 1
+    assert window.canvas.annotations[0].bbox.width < 3
+    assert not window._editor_is_dirty()

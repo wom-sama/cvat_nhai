@@ -82,6 +82,34 @@ def test_scan_and_round_trip_multiple_yolo_boxes(tmp_path: Path) -> None:
     assert serialized == sample.label_path.read_text(encoding="utf-8")
 
 
+def test_tiny_positive_bbox_is_loaded_and_round_trips(tmp_path: Path) -> None:
+    label = tmp_path / "tiny.txt"
+    original = (
+        "4 0.032531 0.144258 0.002156 0.002172\n"
+        "4 0.514641 0.505453 0.970719 0.715906\n"
+    )
+    label.write_text(original, encoding="utf-8")
+
+    annotations = read_yolo_annotations(label, 640, 640, 5)
+
+    assert len(annotations) == 2
+    assert annotations[0].bbox.width == pytest.approx(1.37984)
+    assert annotations[0].bbox.height == pytest.approx(1.39008)
+    assert annotations[1].bbox.area > annotations[0].bbox.area
+    assert serialize_yolo_annotations(annotations, 640, 640, 5) == original
+
+
+def test_bbox_truly_outside_image_is_rejected(tmp_path: Path) -> None:
+    label = tmp_path / "outside.txt"
+    label.write_text(
+        "0 0.950000 0.500000 0.200000 0.200000\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(YoloEditorError, match="vuot ngoai bien"):
+        read_yolo_annotations(label, 640, 640, 5)
+
+
 def test_save_annotations_backs_up_and_updates_balance(tmp_path: Path) -> None:
     root = make_yolo_dataset(tmp_path / "dataset")
     index = scan_yolo_dataset(root)

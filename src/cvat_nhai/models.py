@@ -42,11 +42,21 @@ class BBox:
     def is_valid(self, min_size: float = 3.0) -> bool:
         return self.width >= min_size and self.height >= min_size
 
-    def to_yolo(self, image_width: int, image_height: int) -> Tuple[float, float, float, float]:
+    def to_yolo(
+        self,
+        image_width: int,
+        image_height: int,
+        min_size: float = 3.0,
+        clamp_box: bool = True,
+    ) -> Tuple[float, float, float, float]:
         if image_width <= 0 or image_height <= 0:
             raise ValueError("Image dimensions must be positive")
-        box = self.clamp(image_width, image_height)
-        if not box.is_valid():
+        box = (
+            self.clamp(image_width, image_height)
+            if clamp_box
+            else self.normalized()
+        )
+        if not box.is_valid(min_size=min_size):
             raise ValueError("Bounding box is too small")
         center_x = (box.x1 + box.x2) / 2.0 / image_width
         center_y = (box.y1 + box.y2) / 2.0 / image_height
@@ -74,17 +84,19 @@ class BBox:
         height: float,
         image_width: int,
         image_height: int,
+        clamp_box: bool = True,
     ) -> "BBox":
         pixel_width = width * image_width
         pixel_height = height * image_height
         pixel_center_x = center_x * image_width
         pixel_center_y = center_y * image_height
-        return cls(
+        box = cls(
             pixel_center_x - pixel_width / 2.0,
             pixel_center_y - pixel_height / 2.0,
             pixel_center_x + pixel_width / 2.0,
             pixel_center_y + pixel_height / 2.0,
-        ).clamp(image_width, image_height)
+        )
+        return box.clamp(image_width, image_height) if clamp_box else box
 
 
 @dataclass(frozen=True)
