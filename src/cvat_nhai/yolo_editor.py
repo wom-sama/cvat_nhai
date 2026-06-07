@@ -10,7 +10,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageOps
 
@@ -39,6 +39,41 @@ from .utils import (
 
 class YoloEditorError(RuntimeError):
     pass
+
+
+class ExportCancelled(YoloEditorError):
+    pass
+
+
+ProgressCallback = Optional[Callable[[dict], None]]
+
+
+def _check_export_cancelled(
+    cancel_event: Optional[threading.Event],
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ExportCancelled("Export da bi huy an toan")
+
+
+def _report_export_progress(
+    progress_callback: ProgressCallback,
+    stage: str,
+    detail: str,
+    value: int,
+    maximum: int,
+) -> None:
+    if progress_callback is not None:
+        try:
+            progress_callback(
+                {
+                    "stage": stage,
+                    "detail": detail,
+                    "value": int(value),
+                    "maximum": int(maximum),
+                }
+            )
+        except Exception:
+            pass
 
 
 def _resolve_data_yaml(source: Path) -> Path:
@@ -626,39 +661,64 @@ def _thumbnails_are_near(left: bytes, right: bytes) -> bool:
 
 def _load_export_sources(
     index: YoloDatasetIndex,
+    progress_callback: ProgressCallback = None,
+    cancel_event: Optional[threading.Event] = None,
+    progress_maximum: int = 0,
 ) -> Tuple[List[_ExportSource], int]:
     sources = []
     skipped = 0
-    for sample in index.samples:
+    sample_total = len(index.samples)
+    for sample_index, sample in enumerate(index.samples, 1):
+        _check_export_cancelled(cancel_event)
         if not sample.image_path.exists():
             skipped += 1
-            continue
-        with Image.open(sample.image_path) as opened:
-            image = ImageOps.exif_transpose(opened).convert("RGB")
-            width, height = image.size
-            annotations = tuple(
-                read_yolo_annotations(
-                    sample.label_path,
-                    width,
-                    height,
-                    len(index.class_names),
+        else:
+            with Image.open(sample.image_path) as opened:
+                image = ImageOps.exif_transpose(opened).convert("RGB")
+                width, height = image.size
+                annotations = tuple(
+                    read_yolo_annotations(
+                        sample.label_path,
+                        width,
+                        height,
+                        len(index.class_names),
+                    )
                 )
-            )
-            sources.append(
-                _ExportSource(
-                    sample=sample,
-                    annotations=annotations,
-                    width=width,
-                    height=height,
-                    family_key=_source_family(sample.image_path),
-                    visual_key=_visual_fingerprint(image),
+                sources.append(
+                    _ExportSource(
+                        sample=sample,
+                        annotations=annotations,
+                        width=width,
+                        height=height,
+                        family_key=_source_family(sample.image_path),
+                        visual_key=_visual_fingerprint(image),
+                    )
                 )
+        if (
+            sample_index == 1
+            or sample_index % 10 == 0
+            or sample_index == sample_total
+        ):
+            _report_export_progress(
+                progress_callback,
+                "1/4 Dang doc va phan tich anh",
+                "{} / {} - {}".format(
+                    sample_index,
+                    sample_total,
+                    sample.image_path.name,
+                ),
+                sample_index,
+                progress_maximum,
             )
     return sources, skipped
 
 
 def _build_export_groups(
     sources: Sequence[_ExportSource],
+    progress_callback: ProgressCallback = None,
+    cancel_event: Optional[threading.Event] = None,
+    progress_value: int = 0,
+    progress_maximum: int = 0,
 ) -> List[_ExportGroup]:
     parents = list(range(len(sources)))
 
@@ -678,6 +738,7 @@ def _build_export_groups(
     visual_owners = {}
     visual_bands: Dict[Tuple[str, int, int], List[int]] = {}
     for index, source in enumerate(sources):
+        _check_export_cancelled(cancel_event)
         previous_family = family_owners.get(source.family_key)
         if previous_family is None:
             family_owners[source.family_key] = index
@@ -687,6 +748,17 @@ def _build_export_groups(
         previous_visual = visual_owners.get(source.visual_key)
         if previous_visual is not None:
             union(index, previous_visual)
+            if index % 100 == 0 or index + 1 == len(sources):
+                _report_export_progress(
+                    progress_callback,
+                    "2/4 Dang nhom anh chong data leak",
+                    "{} / {} anh da nhom".format(
+                        index + 1,
+                        len(sources),
+                    ),
+                    progress_value,
+                    progress_maximum,
+                )
             continue
         visual_owners[source.visual_key] = index
         visual_hash, color_key, thumbnail = source.visual_key
@@ -711,6 +783,17 @@ def _build_export_groups(
                 ):
                     union(index, candidate_index)
             bucket.append(index)
+        if index % 100 == 0 or index + 1 == len(sources):
+            _report_export_progress(
+                progress_callback,
+                "2/4 Dang nhom anh chong data leak",
+                "{} / {} anh da nhom".format(
+                    index + 1,
+                    len(sources),
+                ),
+                progress_value,
+                progress_maximum,
+            )
 
     members: Dict[int, List[int]] = {}
     for index in range(len(sources)):
@@ -752,6 +835,10 @@ def _assign_group_splits(
     sources: Sequence[_ExportSource],
     groups: Sequence[_ExportGroup],
     class_count: int,
+    progress_callback: ProgressCallback = None,
+    cancel_event: Optional[threading.Event] = None,
+    progress_value: int = 0,
+    progress_maximum: int = 0,
 ) -> Tuple[Dict[int, str], Dict[int, str]]:
     total_class_counts = Counter()
     for group in groups:
@@ -787,7 +874,9 @@ def _assign_group_splits(
 
     source_splits = {}
     source_groups = {}
-    for group in sorted(groups, key=priority):
+    ordered_groups = sorted(groups, key=priority)
+    for group_index, group in enumerate(ordered_groups, 1):
+        _check_export_cancelled(cancel_event)
         scored_splits = []
         for split_order, split in enumerate(SPLITS):
             class_delta = 0.0
@@ -822,6 +911,17 @@ def _assign_group_splits(
         for source_index in group.source_indexes:
             source_splits[source_index] = assigned_split
             source_groups[source_index] = group.key
+        if group_index % 100 == 0 or group_index == len(ordered_groups):
+            _report_export_progress(
+                progress_callback,
+                "3/4 Dang can bang train / val / test",
+                "{} / {} nhom da chia".format(
+                    group_index,
+                    len(ordered_groups),
+                ),
+                progress_value,
+                progress_maximum,
+            )
     return source_splits, source_groups
 
 
@@ -859,6 +959,8 @@ def export_rebalanced_datasets(
     index: YoloDatasetIndex,
     destination: Path,
     crop_padding: float = 0.08,
+    progress_callback: ProgressCallback = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> ExportReport:
     destination = destination.expanduser().resolve()
     try:
@@ -871,6 +973,7 @@ def export_rebalanced_datasets(
         )
     if destination.exists() and any(destination.iterdir()):
         raise YoloEditorError("Thu muc export phai rong")
+    destination_existed = destination.exists()
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
         tempfile.mkdtemp(
@@ -878,8 +981,8 @@ def export_rebalanced_datasets(
             dir=str(destination.parent),
         )
     )
-    detection_root = staging / "dataset"
-    classification_root = staging / "cls_crops"
+    detection_root = staging / "yolo_f"
+    classification_root = staging / "class_f"
     counts = Counter()
     split_class_counts: Dict[str, Counter] = {
         split: Counter() for split in SPLITS
@@ -888,14 +991,40 @@ def export_rebalanced_datasets(
     split_classification_image_counts = Counter()
     classification_manifest_rows = []
     detection_manifest_rows = []
+    source_total = len(index.samples)
+    progress_maximum = max(1, source_total * 2 + 3)
+    _report_export_progress(
+        progress_callback,
+        "Dang chuan bi export",
+        "{} anh se duoc kiem tra".format(source_total),
+        0,
+        progress_maximum,
+    )
     try:
-        sources, skipped = _load_export_sources(index)
-        groups = _build_export_groups(sources)
+        _check_export_cancelled(cancel_event)
+        sources, skipped = _load_export_sources(
+            index,
+            progress_callback,
+            cancel_event,
+            progress_maximum,
+        )
+        groups = _build_export_groups(
+            sources,
+            progress_callback,
+            cancel_event,
+            source_total + 1,
+            progress_maximum,
+        )
         source_splits, source_groups = _assign_group_splits(
             sources,
             groups,
             len(index.class_names),
+            progress_callback,
+            cancel_event,
+            source_total + 2,
+            progress_maximum,
         )
+        _check_export_cancelled(cancel_event)
         output_stems = _unique_output_stems(sources, source_splits)
 
         for split in SPLITS:
@@ -918,6 +1047,7 @@ def export_rebalanced_datasets(
                 )
 
         for source_index, source in enumerate(sources):
+            _check_export_cancelled(cancel_event)
             sample = source.sample
             split = source_splits[source_index]
             group_key = source_groups[source_index]
@@ -985,6 +1115,7 @@ def export_rebalanced_datasets(
                 for object_index, annotation in enumerate(
                     source.annotations
                 ):
+                    _check_export_cancelled(cancel_event)
                     class_name = safe_stem(
                         index.class_names[annotation.class_id]
                     )
@@ -1025,7 +1156,26 @@ def export_rebalanced_datasets(
                             group_key,
                         ]
                     )
+            _report_export_progress(
+                progress_callback,
+                "4/4 Dang ghi yolo_f va class_f",
+                "{} / {} - {}".format(
+                    source_index + 1,
+                    len(sources),
+                    sample.image_path.name,
+                ),
+                source_total + 2 + source_index + 1,
+                progress_maximum,
+            )
 
+        _check_export_cancelled(cancel_event)
+        _report_export_progress(
+            progress_callback,
+            "Dang ghi file cau hinh",
+            "Dang tao manifest.csv, data.yaml va thong ke",
+            progress_maximum - 1,
+            progress_maximum,
+        )
         with (classification_root / "manifest.csv").open(
             "w",
             newline="",
@@ -1123,9 +1273,20 @@ def export_rebalanced_datasets(
                 },
             },
         )
+        _check_export_cancelled(cancel_event)
         if destination.exists():
             destination.rmdir()
         os.replace(str(staging), str(destination))
+        _report_export_progress(
+            progress_callback,
+            "Export hoan tat",
+            "{} anh YOLO, {} crop classification".format(
+                len(sources),
+                sum(counts.values()),
+            ),
+            progress_maximum,
+            progress_maximum,
+        )
         return ExportReport(
             destination=destination,
             images=len(sources),
@@ -1135,6 +1296,8 @@ def export_rebalanced_datasets(
         )
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
+        if destination_existed and not destination.exists():
+            destination.mkdir(parents=True, exist_ok=True)
         raise
 
 

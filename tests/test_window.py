@@ -1,10 +1,17 @@
+import time
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
+import cvat_nhai.main_window as main_window_module
 from cvat_nhai.main_window import MainWindow
-from cvat_nhai.models import BBox, YoloAnnotation
+from cvat_nhai.models import (
+    BBox,
+    ExportReport,
+    YoloAnnotation,
+    YoloDatasetIndex,
+)
 from cvat_nhai.schema import audit_schema
 from cvat_nhai.utils import atomic_write_yaml
 
@@ -121,6 +128,91 @@ def test_destination_root_creates_both_five_class_datasets(
         window.detection_root,
         window.classification_root,
     ).ready
+
+
+def test_export_dialog_reports_progress_without_blocking_ui(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    destination = tmp_path / "export"
+    destination.mkdir()
+
+    def slow_export(
+        index,
+        output,
+        crop_padding,
+        progress_callback=None,
+        cancel_event=None,
+    ):
+        for value in range(1, 8):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Export da bi huy an toan")
+            progress_callback(
+                {
+                    "stage": "4/4 Dang ghi yolo_f va class_f",
+                    "detail": "{} / 7".format(value),
+                    "value": value,
+                    "maximum": 7,
+                }
+            )
+            time.sleep(0.04)
+        return ExportReport(
+            destination=Path(output),
+            images=7,
+            objects=7,
+            skipped=0,
+            class_counts={0: 7},
+        )
+
+    monkeypatch.setattr(
+        main_window_module,
+        "export_rebalanced_datasets",
+        slow_export,
+    )
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getExistingDirectory",
+        lambda *args: str(destination),
+    )
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "information",
+        lambda *args: None,
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.mode_combo.setCurrentIndex(1)
+    assert window.export_button.text() == "Xuat yolo_f + class_f"
+    window.editor_index = YoloDatasetIndex(
+        root=tmp_path / "source",
+        data_yaml=tmp_path / "source" / "data.yaml",
+        class_names=("class0",),
+        samples=(),
+    )
+
+    heartbeats = []
+    heartbeat = QTimer()
+    heartbeat.setInterval(10)
+    heartbeat.timeout.connect(lambda: heartbeats.append(1))
+    heartbeat.start()
+    qtbot.mouseClick(window.export_button, Qt.LeftButton)
+
+    qtbot.waitUntil(
+        lambda: (
+            window.export_progress_dialog is not None
+            and window.export_progress_dialog.progress_bar.value() >= 3
+        ),
+        timeout=3000,
+    )
+    assert window.busy
+    assert window.export_progress_dialog.isVisible()
+    assert len(heartbeats) >= 3
+    qtbot.waitUntil(lambda: not window.busy, timeout=3000)
+    heartbeat.stop()
+    assert window.export_progress_dialog is None
 
 
 def test_yolo_editor_mode_loads_resets_saves_and_deletes(

@@ -33,6 +33,7 @@ from .constants import (
     DEFAULT_DETECTION_ROOT,
 )
 from .dataset import DatasetError, DatasetManager
+from .export_progress_dialog import ExportProgressDialog
 from .migration import apply_migration
 from .models import BBox, DatasetPaths, MigrationReport
 from .scanner import scan_images
@@ -127,6 +128,10 @@ class MainWindow(QMainWindow):
         self.navigation_timer.timeout.connect(
             self._repeat_navigation
         )
+        self.export_task: Optional[FunctionTask] = None
+        self.export_progress_dialog: Optional[
+            ExportProgressDialog
+        ] = None
 
         self._build_ui()
         self._build_actions()
@@ -239,7 +244,7 @@ class MainWindow(QMainWindow):
         side.addWidget(self.progress)
 
         self.export_button = QPushButton(
-            "Xuat lai YOLO + classification"
+            "Xuat yolo_f + class_f"
         )
         self.export_button.clicked.connect(self.export_editor_dataset)
         self.export_button.setVisible(False)
@@ -1166,7 +1171,7 @@ class MainWindow(QMainWindow):
             return
         destination = QFileDialog.getExistingDirectory(
             self,
-            "Chon thu muc rong de xuat YOLO + classification",
+            "Chon thu muc rong de tao yolo_f + class_f",
             str(self.editor_index.root.parent),
         )
         if not destination:
@@ -1177,20 +1182,32 @@ class MainWindow(QMainWindow):
             return
         self._set_busy(
             True,
-            "Dang chia lai va xuat YOLO + classification...",
+            "Dang chia lai va xuat yolo_f + class_f...",
         )
         task = FunctionTask(
             export_rebalanced_datasets,
             self.editor_index,
             path,
             self.crop_padding,
+            report_progress=True,
         )
+        self.export_task = task
+        dialog = ExportProgressDialog(self)
+        self.export_progress_dialog = dialog
+        dialog.cancel_requested.connect(task.cancel)
+        task.signals.progress.connect(dialog.update_progress)
         task.signals.succeeded.connect(self._export_finished)
-        task.signals.failed.connect(self._background_failed)
-        task.signals.finished.connect(lambda: self._set_busy(False))
-        self._start_task(task)
+        task.signals.failed.connect(self._export_failed)
+        task.signals.finished.connect(self._export_task_finished)
+        dialog.show()
+        QTimer.singleShot(
+            0,
+            lambda value=task: self._start_task(value),
+        )
 
     def _export_finished(self, result: object) -> None:
+        if self.export_progress_dialog is not None:
+            self.export_progress_dialog.finish()
         QMessageBox.information(
             self,
             "Export hoan tat",
@@ -1200,10 +1217,30 @@ class MainWindow(QMainWindow):
             ).format(
                 result.objects,
                 result.images,
-                result.destination / "dataset",
-                result.destination / "cls_crops",
+                result.destination / "yolo_f",
+                result.destination / "class_f",
             ),
         )
+
+    def _export_failed(self, traceback_text: str) -> None:
+        if self.export_progress_dialog is not None:
+            self.export_progress_dialog.finish()
+        lines = traceback_text.strip().splitlines()
+        message = lines[-1] if lines else "Loi khong xac dinh"
+        if "Export da bi huy an toan" in message:
+            self.statusBar().showMessage(
+                "Da huy export; thu muc tam da duoc don",
+                5000,
+            )
+            return
+        self._show_error(message)
+
+    def _export_task_finished(self) -> None:
+        if self.export_progress_dialog is not None:
+            self.export_progress_dialog.finish()
+        self.export_progress_dialog = None
+        self.export_task = None
+        self._set_busy(False)
 
     def _operation_finished(self, path: Path, result: object) -> None:
         if path in self.images:
@@ -1475,6 +1512,11 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Loi", message)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self.export_task is not None:
+            if self.export_progress_dialog is not None:
+                self.export_progress_dialog.request_cancel()
+            event.ignore()
+            return
         self._stop_continuous_navigation()
         self.settings.sync()
         super().closeEvent(event)

@@ -97,12 +97,12 @@ BBox duong nhung nho hon 3 pixel van duoc nap; UI ve marker toi thieu de co
 the click/xoa, trong khi toa do YOLO goc duoc giu nguyen. Khi mot anh co
 nhieu object, box co dien tich lon nhat duoc chon mac dinh.
 
-Nut `Xuat lai YOLO + classification` chon mot thu muc goc rong va tao:
+Nut `Xuat yolo_f + class_f` chon mot thu muc goc rong va tao:
 
 ```text
-<export>\dataset\images\<split>\*
-<export>\dataset\labels\<split>\*.txt
-<export>\cls_crops\<split>\<class_name>\*_boxNNN.jpg
+<export>\yolo_f\images\<split>\*
+<export>\yolo_f\labels\<split>\*.txt
+<export>\class_f\<split>\<class_name>\*_boxNNN.jpg
 ```
 
 Ca hai bo dung cung mot split moi theo ty le 70/20/10. Thuat toan can bang
@@ -112,11 +112,15 @@ fingerprint duoc khoa trong cung mot `leakage_group`, nen khong the nam dong
 thoi o train va val/test. `manifest.csv` luu split nguon, split moi va group
 de audit data leak.
 
-Moi bo co `data.yaml`, `manifest.csv` va `canbang.yaml`; `cls_crops` co them
+Moi bo co `data.yaml`, `manifest.csv` va `canbang.yaml`; `class_f` co them
 `stats.json`. Thu muc export bat buoc phai rong; ket qua duoc dung trong thu
 muc tam va chi duoc dua vao dich sau khi toan bo anh, nhan va crop thanh
 cong. Thu muc dich phai nam ngoai dataset nguon. Dataset YOLO nguon khong
 bi di chuyen hay sap xep lai.
+
+Khi export, ung dung hien dialog gom 4 giai doan, ten anh dang xu ly va thanh
+tien do. Nut `Huy an toan` dung tai diem an toan va xoa thu muc tam; dataset
+nguon khong bi thay doi va khong de lai bo export dang do.
 
 Trong che do sua, `Tab` chon box ke tiep va `Shift+Tab` chon box truoc do,
 ke ca khi focus dang nam tren sidebar.

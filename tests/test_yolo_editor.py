@@ -1,4 +1,5 @@
 import csv
+import threading
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from cvat_nhai.utils import atomic_write_yaml, load_yaml, names_from_yaml
 from cvat_nhai.yolo_editor import (
     YoloDatasetEditor,
     YoloEditorError,
+    ExportCancelled,
     export_rebalanced_datasets,
     read_yolo_annotations,
     scan_yolo_dataset,
@@ -237,8 +239,8 @@ def test_export_rebalanced_datasets_uses_edited_labels(
     assert report.images == 2
     assert report.objects == 2
     assert report.class_counts == {2: 2}
-    classification = destination / "cls_crops"
-    detection = destination / "dataset"
+    classification = destination / "class_f"
+    detection = destination / "yolo_f"
     crops = sorted(classification.rglob("*_box*.jpg"))
     assert len(crops) == 2
     a_crop = next(path for path in crops if path.name == "a_box000.jpg")
@@ -356,7 +358,7 @@ def test_export_stratifies_each_class_and_groups_duplicates(
     )
 
     assert report.images == 31
-    with (destination / "cls_crops" / "manifest.csv").open(
+    with (destination / "class_f" / "manifest.csv").open(
         newline="",
         encoding="utf-8",
     ) as handle:
@@ -395,7 +397,7 @@ def test_export_stratifies_each_class_and_groups_duplicates(
     assert len({row["split"] for row in duplicate_rows}) == 1
     assert len({row["leakage_group"] for row in duplicate_rows}) == 1
 
-    with (destination / "dataset" / "manifest.csv").open(
+    with (destination / "yolo_f" / "manifest.csv").open(
         newline="",
         encoding="utf-8",
     ) as handle:
@@ -414,13 +416,13 @@ def test_export_stratifies_each_class_and_groups_duplicates(
         for row in rows
     )
     assert (
-        load_yaml(destination / "dataset" / "data.yaml")[
+        load_yaml(destination / "yolo_f" / "data.yaml")[
             "split_strategy"
         ]
         == "stratified_group"
     )
     assert load_yaml(
-        destination / "cls_crops" / "stats.json"
+        destination / "class_f" / "stats.json"
     )["source_groups"] == 30
 
     second_destination = tmp_path / "balanced_export_again"
@@ -429,7 +431,7 @@ def test_export_stratifies_each_class_and_groups_duplicates(
         second_destination,
         crop_padding=0.0,
     )
-    with (second_destination / "dataset" / "manifest.csv").open(
+    with (second_destination / "yolo_f" / "manifest.csv").open(
         newline="",
         encoding="utf-8",
     ) as handle:
@@ -461,7 +463,7 @@ def test_export_keeps_negative_images_in_yolo_dataset(
 
     assert report.images == 3
     assert report.objects == 3
-    with (destination / "dataset" / "manifest.csv").open(
+    with (destination / "yolo_f" / "manifest.csv").open(
         newline="",
         encoding="utf-8",
     ) as handle:
@@ -475,14 +477,14 @@ def test_export_keeps_negative_images_in_yolo_dataset(
     assert negative_label.exists()
     assert negative_label.read_text(encoding="utf-8") == ""
     detection_balance = load_yaml(
-        destination / "dataset" / "canbang.yaml"
+        destination / "yolo_f" / "canbang.yaml"
     )["dataset_balance"]
     classification_balance = load_yaml(
-        destination / "cls_crops" / "canbang.yaml"
+        destination / "class_f" / "canbang.yaml"
     )["dataset_balance"]
     assert detection_balance["total_images"] == 3
     assert classification_balance["total_images"] == 2
-    with (destination / "cls_crops" / "manifest.csv").open(
+    with (destination / "class_f" / "manifest.csv").open(
         newline="",
         encoding="utf-8",
     ) as handle:
@@ -515,3 +517,58 @@ def test_export_refuses_destination_inside_source_dataset(
     with pytest.raises(YoloEditorError, match="nam ngoai"):
         export_rebalanced_datasets(index, destination)
     assert not any(destination.iterdir())
+
+
+def test_export_reports_progress_and_creates_named_subfolders(
+    tmp_path: Path,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "dataset")
+    destination = tmp_path / "export"
+    events = []
+
+    report = export_rebalanced_datasets(
+        scan_yolo_dataset(root),
+        destination,
+        progress_callback=events.append,
+    )
+
+    assert report.images == 2
+    assert {
+        path.name for path in destination.iterdir()
+    } == {"yolo_f", "class_f"}
+    assert (destination / "yolo_f" / "data.yaml").exists()
+    assert (destination / "class_f" / "data.yaml").exists()
+    assert events[0]["stage"] == "Dang chuan bi export"
+    assert events[-1]["stage"] == "Export hoan tat"
+    assert events[-1]["value"] == events[-1]["maximum"]
+    assert {
+        event["stage"].split(" ")[0]
+        for event in events
+        if event["stage"][0].isdigit()
+    } == {"1/4", "2/4", "3/4", "4/4"}
+
+
+def test_cancelled_export_removes_staging_and_keeps_destination_empty(
+    tmp_path: Path,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "dataset")
+    destination = tmp_path / "export"
+    destination.mkdir()
+    cancel_event = threading.Event()
+
+    def cancel_after_first_image(payload):
+        if payload["stage"].startswith("1/4"):
+            cancel_event.set()
+
+    with pytest.raises(ExportCancelled):
+        export_rebalanced_datasets(
+            scan_yolo_dataset(root),
+            destination,
+            progress_callback=cancel_after_first_image,
+            cancel_event=cancel_event,
+        )
+
+    assert not any(destination.iterdir())
+    assert not list(
+        tmp_path.glob(".cvat_nhai_export_*")
+    )
