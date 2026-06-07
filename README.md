@@ -97,17 +97,29 @@ BBox duong nhung nho hon 3 pixel van duoc nap; UI ve marker toi thieu de co
 the click/xoa, trong khi toa do YOLO goc duoc giu nguyen. Khi mot anh co
 nhieu object, box co dien tich lon nhat duoc chon mac dinh.
 
-Nut `Xuat classification folder tu nhan da sua` tao:
+Nut `Xuat lai YOLO + classification` chon mot thu muc goc rong va tao:
 
 ```text
-<export>\train\<class_name>\*_boxNNN.jpg
-<export>\val\<class_name>\*_boxNNN.jpg
-<export>\test\<class_name>\*_boxNNN.jpg
+<export>\dataset\images\<split>\*
+<export>\dataset\labels\<split>\*.txt
+<export>\cls_crops\<split>\<class_name>\*_boxNNN.jpg
 ```
 
-Kem theo `data.yaml`, `manifest.csv`, `stats.json` va `canbang.yaml`.
-Thu muc export bat buoc phai rong; ket qua duoc dung trong thu muc tam va
-chi duoc dua vao dich sau khi toan bo crop thanh cong.
+Ca hai bo dung cung mot split moi theo ty le 70/20/10. Thuat toan can bang
+so object cua tung class thay vi chi chia tong so anh. Tat ca bbox cua cung
+mot anh, anh co cung family name va anh trung/noi dung gan trung theo visual
+fingerprint duoc khoa trong cung mot `leakage_group`, nen khong the nam dong
+thoi o train va val/test. `manifest.csv` luu split nguon, split moi va group
+de audit data leak.
+
+Moi bo co `data.yaml`, `manifest.csv` va `canbang.yaml`; `cls_crops` co them
+`stats.json`. Thu muc export bat buoc phai rong; ket qua duoc dung trong thu
+muc tam va chi duoc dua vao dich sau khi toan bo anh, nhan va crop thanh
+cong. Thu muc dich phai nam ngoai dataset nguon. Dataset YOLO nguon khong
+bi di chuyen hay sap xep lai.
+
+Trong che do sua, `Tab` chon box ke tiep va `Shift+Tab` chon box truoc do,
+ke ca khi focus dang nam tren sidebar.
 
 Anh bi xoa duoc di chuyen vao `work/archive/removed` thay vi xoa vinh vien.
 Dieu nay giu toc do thao tac nhanh nhung van cho phep `Ctrl+Z`.

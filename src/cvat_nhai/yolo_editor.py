@@ -1,13 +1,16 @@
 import csv
+import hashlib
 import os
+import re
 import shutil
 import tempfile
 import threading
 import uuid
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 from PIL import Image, ImageOps
 
@@ -446,6 +449,57 @@ class YoloDatasetEditor:
         )
 
 
+SPLIT_RATIOS = {
+    "train": 0.7,
+    "val": 0.2,
+    "test": 0.1,
+}
+
+_DERIVED_IMAGE_SUFFIX = re.compile(
+    (
+        r"(?:[_-](?:box|aug(?:ment(?:ed)?)?|copy|flip(?:ped)?|"
+        r"mirror(?:ed)?|rot(?:ate|ated|ation)?|crop|variant|ver|v)"
+        r"\d*)+$"
+    ),
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _ExportSource:
+    sample: YoloSample
+    annotations: Tuple[YoloAnnotation, ...]
+    width: int
+    height: int
+    family_key: str
+    visual_key: Tuple[int, str, bytes]
+
+
+@dataclass(frozen=True)
+class _ExportGroup:
+    key: str
+    source_indexes: Tuple[int, ...]
+    class_counts: Counter
+
+    @property
+    def image_count(self) -> int:
+        return len(self.source_indexes)
+
+
+def _split_metadata() -> dict:
+    return {
+        "split_strategy": "stratified_group",
+        "split_ratios": dict(SPLIT_RATIOS),
+        "leakage_prevention": {
+            "unit": "source_image_group",
+            "group_by": [
+                "normalized_source_family",
+                "perceptual_visual_fingerprint",
+            ],
+        },
+    }
+
+
 def _classification_yaml(class_names: Sequence[str]) -> dict:
     return {
         "format": "classification_folder",
@@ -458,13 +512,30 @@ def _classification_yaml(class_names: Sequence[str]) -> dict:
         "names": {
             index: str(name) for index, name in enumerate(class_names)
         },
+        **_split_metadata(),
     }
 
 
-def _classification_balance(
+def _detection_yaml(class_names: Sequence[str]) -> dict:
+    return {
+        "path": ".",
+        "train": "images/train",
+        "val": "images/val",
+        "test": "images/test",
+        "nc": len(class_names),
+        "class_name_mode": "raw",
+        "canbang_yaml": "canbang.yaml",
+        "names": [str(name) for name in class_names],
+        **_split_metadata(),
+    }
+
+
+def _export_balance(
     counts: Dict[int, int],
     class_count: int,
     total_images: int,
+    split_class_counts: Dict[str, Counter],
+    split_image_counts: Dict[str, int],
 ) -> dict:
     total_objects = sum(counts.values())
     classes = {}
@@ -481,78 +552,446 @@ def _classification_balance(
             "version_note": "Exported from edited YOLO dataset by CVAT Nhai",
             "total_images": total_images,
             "total_objects": total_objects,
+            **_split_metadata(),
             "classes": classes,
+            "splits": {
+                split: {
+                    "total_images": int(split_image_counts[split]),
+                    "total_objects": int(
+                        sum(split_class_counts[split].values())
+                    ),
+                    "classes": {
+                        str(class_id): int(
+                            split_class_counts[split][class_id]
+                        )
+                        for class_id in range(class_count)
+                    },
+                }
+                for split in SPLITS
+            },
         }
     }
 
 
-def export_classification_folder(
-    index: YoloDatasetIndex,
-    destination: Path,
-    crop_padding: float = 0.08,
-) -> ExportReport:
-    destination = destination.expanduser().resolve()
-    if destination.exists() and any(destination.iterdir()):
-        raise YoloEditorError("Thu muc export phai rong")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(
-        tempfile.mkdtemp(
-            prefix=".cvat_nhai_cls_export_",
-            dir=str(destination.parent),
-        )
+def _source_family(path: Path) -> str:
+    stem = safe_stem(path.stem).casefold()
+    family = _DERIVED_IMAGE_SUFFIX.sub("", stem).rstrip("._-")
+    return family or stem
+
+
+def _visual_fingerprint(image: Image.Image) -> Tuple[int, str, bytes]:
+    gray = image.convert("L").resize((9, 8), Image.Resampling.BILINEAR)
+    pixels = list(gray.getdata())
+    difference_hash = 0
+    for row in range(8):
+        offset = row * 9
+        for column in range(8):
+            difference_hash <<= 1
+            difference_hash |= int(
+                pixels[offset + column]
+                > pixels[offset + column + 1]
+            )
+    average = image.resize((1, 1), Image.Resampling.BILINEAR).getpixel(
+        (0, 0)
     )
-    counts = Counter()
-    split_counts: Dict[str, Counter] = {
-        split: Counter() for split in SPLITS
-    }
-    manifest_rows = []
-    exported_images = set()
+    color_key = "".join(str(int(channel) // 64) for channel in average)
+    color_thumbnail = image.resize(
+        (16, 16),
+        Image.Resampling.BILINEAR,
+    )
+    quantized_thumbnail = bytes(
+        value // 32 for value in color_thumbnail.tobytes()
+    )
+    return difference_hash, color_key, quantized_thumbnail
+
+
+def _thumbnails_are_near(left: bytes, right: bytes) -> bool:
+    maximum_difference = len(left) * 0.4
+    total_difference = 0
+    for left_value, right_value in zip(left, right):
+        total_difference += abs(left_value - right_value)
+        if total_difference > maximum_difference:
+            return False
+    return True
+
+
+def _load_export_sources(
+    index: YoloDatasetIndex,
+) -> Tuple[List[_ExportSource], int]:
+    sources = []
     skipped = 0
-    try:
-        for split in SPLITS:
-            for class_name in index.class_names:
-                (staging / split / safe_stem(class_name)).mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-        for sample in index.samples:
-            if not sample.image_path.exists():
-                skipped += 1
-                continue
-            with Image.open(sample.image_path) as opened:
-                image = ImageOps.exif_transpose(opened).convert("RGB")
-                width, height = image.size
-                annotations = read_yolo_annotations(
+    for sample in index.samples:
+        if not sample.image_path.exists():
+            skipped += 1
+            continue
+        with Image.open(sample.image_path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+            width, height = image.size
+            annotations = tuple(
+                read_yolo_annotations(
                     sample.label_path,
                     width,
                     height,
                     len(index.class_names),
                 )
-                for object_index, annotation in enumerate(annotations):
+            )
+            sources.append(
+                _ExportSource(
+                    sample=sample,
+                    annotations=annotations,
+                    width=width,
+                    height=height,
+                    family_key=_source_family(sample.image_path),
+                    visual_key=_visual_fingerprint(image),
+                )
+            )
+    return sources, skipped
+
+
+def _build_export_groups(
+    sources: Sequence[_ExportSource],
+) -> List[_ExportGroup]:
+    parents = list(range(len(sources)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    family_owners = {}
+    visual_owners = {}
+    visual_bands: Dict[Tuple[str, int, int], List[int]] = {}
+    for index, source in enumerate(sources):
+        previous_family = family_owners.get(source.family_key)
+        if previous_family is None:
+            family_owners[source.family_key] = index
+        else:
+            union(index, previous_family)
+
+        previous_visual = visual_owners.get(source.visual_key)
+        if previous_visual is not None:
+            union(index, previous_visual)
+            continue
+        visual_owners[source.visual_key] = index
+        visual_hash, color_key, thumbnail = source.visual_key
+        checked_candidates = set()
+        for band_index in range(8):
+            band_value = (visual_hash >> (band_index * 8)) & 0xFF
+            bucket_key = (color_key, band_index, band_value)
+            bucket = visual_bands.setdefault(bucket_key, [])
+            for candidate_index in bucket:
+                if candidate_index in checked_candidates:
+                    continue
+                checked_candidates.add(candidate_index)
+                candidate_hash, _, candidate_thumbnail = sources[
+                    candidate_index
+                ].visual_key
+                if (
+                    bin(visual_hash ^ candidate_hash).count("1") <= 3
+                    and _thumbnails_are_near(
+                        thumbnail,
+                        candidate_thumbnail,
+                    )
+                ):
+                    union(index, candidate_index)
+            bucket.append(index)
+
+    members: Dict[int, List[int]] = {}
+    for index in range(len(sources)):
+        members.setdefault(find(index), []).append(index)
+
+    groups = []
+    for indexes in members.values():
+        ordered = tuple(
+            sorted(
+                indexes,
+                key=lambda value: str(
+                    sources[value].sample.image_path
+                ).casefold(),
+            )
+        )
+        paths = "\n".join(
+            str(sources[index].sample.image_path.resolve()).casefold()
+            for index in ordered
+        )
+        class_counts = Counter()
+        for index in ordered:
+            class_counts.update(
+                annotation.class_id
+                for annotation in sources[index].annotations
+            )
+        groups.append(
+            _ExportGroup(
+                key=hashlib.sha256(
+                    paths.encode("utf-8", errors="replace")
+                ).hexdigest()[:16],
+                source_indexes=ordered,
+                class_counts=class_counts,
+            )
+        )
+    return groups
+
+
+def _assign_group_splits(
+    sources: Sequence[_ExportSource],
+    groups: Sequence[_ExportGroup],
+    class_count: int,
+) -> Tuple[Dict[int, str], Dict[int, str]]:
+    total_class_counts = Counter()
+    for group in groups:
+        total_class_counts.update(group.class_counts)
+    total_images = len(sources)
+    target_classes = {
+        split: {
+            class_id: total_class_counts[class_id] * SPLIT_RATIOS[split]
+            for class_id in range(class_count)
+        }
+        for split in SPLITS
+    }
+    target_images = {
+        split: total_images * SPLIT_RATIOS[split]
+        for split in SPLITS
+    }
+    current_classes = {
+        split: Counter() for split in SPLITS
+    }
+    current_images = Counter()
+
+    def priority(group: _ExportGroup) -> tuple:
+        rarity = sum(
+            count / max(1, total_class_counts[class_id])
+            for class_id, count in group.class_counts.items()
+        )
+        return (
+            -rarity,
+            -sum(group.class_counts.values()),
+            -group.image_count,
+            group.key,
+        )
+
+    source_splits = {}
+    source_groups = {}
+    for group in sorted(groups, key=priority):
+        scored_splits = []
+        for split_order, split in enumerate(SPLITS):
+            class_delta = 0.0
+            for class_id in range(class_count):
+                total = max(1, total_class_counts[class_id])
+                before = (
+                    current_classes[split][class_id]
+                    - target_classes[split][class_id]
+                ) / total
+                after = (
+                    current_classes[split][class_id]
+                    + group.class_counts[class_id]
+                    - target_classes[split][class_id]
+                ) / total
+                class_delta += after * after - before * before
+            image_total = max(1, total_images)
+            image_before = (
+                current_images[split] - target_images[split]
+            ) / image_total
+            image_after = (
+                current_images[split]
+                + group.image_count
+                - target_images[split]
+            ) / image_total
+            image_delta = image_after * image_after - image_before * image_before
+            scored_splits.append(
+                (class_delta + 0.35 * image_delta, split_order, split)
+            )
+        assigned_split = min(scored_splits)[2]
+        current_classes[assigned_split].update(group.class_counts)
+        current_images[assigned_split] += group.image_count
+        for source_index in group.source_indexes:
+            source_splits[source_index] = assigned_split
+            source_groups[source_index] = group.key
+    return source_splits, source_groups
+
+
+def _unique_output_stems(
+    sources: Sequence[_ExportSource],
+    source_splits: Dict[int, str],
+) -> Dict[int, str]:
+    used = {split: set() for split in SPLITS}
+    result = {}
+    for index, source in sorted(
+        enumerate(sources),
+        key=lambda item: str(item[1].sample.image_path).casefold(),
+    ):
+        split = source_splits[index]
+        base = safe_stem(source.sample.image_path.stem)
+        candidate = base
+        suffix = hashlib.sha1(
+            str(source.sample.image_path.resolve()).encode(
+                "utf-8",
+                errors="replace",
+            )
+        ).hexdigest()[:8]
+        if candidate.casefold() in used[split]:
+            candidate = "{}__{}".format(base, suffix)
+        counter = 2
+        while candidate.casefold() in used[split]:
+            candidate = "{}__{}_{:02d}".format(base, suffix, counter)
+            counter += 1
+        used[split].add(candidate.casefold())
+        result[index] = candidate
+    return result
+
+
+def export_rebalanced_datasets(
+    index: YoloDatasetIndex,
+    destination: Path,
+    crop_padding: float = 0.08,
+) -> ExportReport:
+    destination = destination.expanduser().resolve()
+    try:
+        destination.relative_to(index.root.resolve())
+    except ValueError:
+        pass
+    else:
+        raise YoloEditorError(
+            "Thu muc export phai nam ngoai dataset YOLO nguon"
+        )
+    if destination.exists() and any(destination.iterdir()):
+        raise YoloEditorError("Thu muc export phai rong")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=".cvat_nhai_export_",
+            dir=str(destination.parent),
+        )
+    )
+    detection_root = staging / "dataset"
+    classification_root = staging / "cls_crops"
+    counts = Counter()
+    split_class_counts: Dict[str, Counter] = {
+        split: Counter() for split in SPLITS
+    }
+    split_yolo_image_counts = Counter()
+    split_classification_image_counts = Counter()
+    classification_manifest_rows = []
+    detection_manifest_rows = []
+    try:
+        sources, skipped = _load_export_sources(index)
+        groups = _build_export_groups(sources)
+        source_splits, source_groups = _assign_group_splits(
+            sources,
+            groups,
+            len(index.class_names),
+        )
+        output_stems = _unique_output_stems(sources, source_splits)
+
+        for split in SPLITS:
+            (detection_root / "images" / split).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            (detection_root / "labels" / split).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            for class_name in index.class_names:
+                (
+                    classification_root
+                    / split
+                    / safe_stem(class_name)
+                ).mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+        for source_index, source in enumerate(sources):
+            sample = source.sample
+            split = source_splits[source_index]
+            group_key = source_groups[source_index]
+            output_stem = output_stems[source_index]
+            output_image = (
+                detection_root
+                / "images"
+                / split
+                / (output_stem + sample.image_path.suffix.lower())
+            )
+            output_label = (
+                detection_root
+                / "labels"
+                / split
+                / (output_stem + ".txt")
+            )
+            atomic_write_text(
+                output_label,
+                serialize_yolo_annotations(
+                    source.annotations,
+                    source.width,
+                    source.height,
+                    len(index.class_names),
+                ),
+            )
+            split_yolo_image_counts[split] += 1
+            detection_manifest_rows.append(
+                [
+                    split,
+                    sample.split,
+                    group_key,
+                    str(sample.image_path),
+                    str(
+                        destination
+                        / output_image.relative_to(staging)
+                    ),
+                    str(
+                        destination
+                        / output_label.relative_to(staging)
+                    ),
+                ]
+            )
+
+            with Image.open(sample.image_path) as opened:
+                image = ImageOps.exif_transpose(opened).convert("RGB")
+                orientation = opened.getexif().get(274, 1)
+                if orientation in (None, 1):
+                    shutil.copy2(sample.image_path, output_image)
+                elif output_image.suffix.lower() in {".jpg", ".jpeg"}:
+                    image.save(
+                        output_image,
+                        format="JPEG",
+                        quality=95,
+                    )
+                elif output_image.suffix.lower() == ".webp":
+                    image.save(
+                        output_image,
+                        format="WEBP",
+                        quality=95,
+                    )
+                else:
+                    image.save(output_image)
+                if source.annotations:
+                    split_classification_image_counts[split] += 1
+                for object_index, annotation in enumerate(
+                    source.annotations
+                ):
                     class_name = safe_stem(
                         index.class_names[annotation.class_id]
                     )
-                    output_dir = staging / sample.split / class_name
+                    output_dir = (
+                        classification_root / split / class_name
+                    )
                     output_dir.mkdir(parents=True, exist_ok=True)
                     output_name = "{}_box{:03d}.jpg".format(
-                        safe_stem(sample.image_path.stem),
+                        output_stem,
                         object_index,
                     )
                     output_path = output_dir / output_name
-                    if output_path.exists():
-                        output_name = "{}__{}_box{:03d}.jpg".format(
-                            safe_stem(sample.image_path.stem),
-                            uuid.uuid5(
-                                uuid.NAMESPACE_URL,
-                                str(sample.image_path),
-                            ).hex[:8],
-                            object_index,
-                        )
-                        output_path = output_dir / output_name
                     box = annotation.bbox.padded(
                         crop_padding,
-                        width,
-                        height,
+                        source.width,
+                        source.height,
                     )
                     crop = image.crop(
                         (
@@ -564,20 +1003,24 @@ def export_classification_folder(
                     )
                     crop.save(output_path, format="JPEG", quality=95)
                     counts[annotation.class_id] += 1
-                    split_counts[sample.split][class_name] += 1
-                    exported_images.add(sample.image_path)
-                    manifest_rows.append(
+                    split_class_counts[split][annotation.class_id] += 1
+                    classification_manifest_rows.append(
                         [
-                            sample.split,
+                            split,
                             str(sample.image_path),
-                            str(destination / output_path.relative_to(staging)),
+                            str(
+                                destination
+                                / output_path.relative_to(staging)
+                            ),
                             annotation.class_id,
                             class_name,
                             object_index,
+                            sample.split,
+                            group_key,
                         ]
                     )
 
-        with (staging / "manifest.csv").open(
+        with (classification_root / "manifest.csv").open(
             "w",
             newline="",
             encoding="utf-8",
@@ -591,29 +1034,78 @@ def export_classification_folder(
                     "class_id",
                     "class_name",
                     "source",
+                    "source_split",
+                    "leakage_group",
                 ]
             )
-            writer.writerows(manifest_rows)
+            writer.writerows(classification_manifest_rows)
+        with (detection_root / "manifest.csv").open(
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                [
+                    "split",
+                    "source_split",
+                    "leakage_group",
+                    "source_image",
+                    "output_image",
+                    "output_label",
+                ]
+            )
+            writer.writerows(detection_manifest_rows)
         atomic_write_yaml(
-            staging / "data.yaml",
+            detection_root / "data.yaml",
+            _detection_yaml(index.class_names),
+        )
+        atomic_write_yaml(
+            classification_root / "data.yaml",
             _classification_yaml(index.class_names),
         )
+        detection_balance = _export_balance(
+            counts,
+            len(index.class_names),
+            len(sources),
+            split_class_counts,
+            split_yolo_image_counts,
+        )
+        classification_balance = _export_balance(
+            counts,
+            len(index.class_names),
+            sum(bool(source.annotations) for source in sources),
+            split_class_counts,
+            split_classification_image_counts,
+        )
         atomic_write_yaml(
-            staging / "canbang.yaml",
-            _classification_balance(
-                counts,
-                len(index.class_names),
-                len(exported_images),
-            ),
+            detection_root / "canbang.yaml",
+            detection_balance,
+        )
+        atomic_write_yaml(
+            classification_root / "canbang.yaml",
+            classification_balance,
         )
         atomic_write_json(
-            staging / "stats.json",
+            classification_root / "stats.json",
             {
                 "mode": "crop-box",
                 "base_padding": float(crop_padding),
+                **_split_metadata(),
+                "source_groups": len(groups),
                 "splits": {
                     split: {
-                        "classes": dict(split_counts[split]),
+                        "images": int(
+                            split_classification_image_counts[split]
+                        ),
+                        "classes": {
+                            safe_stem(index.class_names[class_id]): int(
+                                split_class_counts[split][class_id]
+                            )
+                            for class_id in range(
+                                len(index.class_names)
+                            )
+                        },
                         "skipped": {},
                     }
                     for split in SPLITS
@@ -625,7 +1117,7 @@ def export_classification_folder(
         os.replace(str(staging), str(destination))
         return ExportReport(
             destination=destination,
-            images=len(exported_images),
+            images=len(sources),
             objects=sum(counts.values()),
             skipped=skipped,
             class_counts=dict(counts),
@@ -633,3 +1125,15 @@ def export_classification_folder(
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def export_classification_folder(
+    index: YoloDatasetIndex,
+    destination: Path,
+    crop_padding: float = 0.08,
+) -> ExportReport:
+    return export_rebalanced_datasets(
+        index,
+        destination,
+        crop_padding,
+    )

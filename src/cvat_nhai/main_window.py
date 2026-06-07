@@ -43,7 +43,7 @@ from .workers import FunctionTask
 from .yolo_editor import (
     YoloDatasetEditor,
     YoloEditorError,
-    export_classification_folder,
+    export_rebalanced_datasets,
     read_yolo_annotations,
     scan_yolo_dataset,
 )
@@ -230,6 +230,13 @@ class MainWindow(QMainWindow):
         self.progress.valueChanged.connect(self._preview_seek_position)
         side.addWidget(self.progress)
 
+        self.export_button = QPushButton(
+            "Xuat lai YOLO + classification"
+        )
+        self.export_button.clicked.connect(self.export_editor_dataset)
+        self.export_button.setVisible(False)
+        side.addWidget(self.export_button)
+
         class_label = QLabel("CHON CLASS (PHIM 1-5)")
         class_label.setObjectName("sectionLabel")
         side.addWidget(class_label)
@@ -297,13 +304,6 @@ class MainWindow(QMainWindow):
         self.remove_box_button.clicked.connect(self.remove_active_box)
         self.remove_box_button.setVisible(False)
         side.addWidget(self.remove_box_button)
-
-        self.export_button = QPushButton(
-            "Xuat classification folder tu nhan da sua"
-        )
-        self.export_button.clicked.connect(self.export_editor_dataset)
-        self.export_button.setVisible(False)
-        side.addWidget(self.export_button)
 
         side_scroll = QScrollArea()
         side_scroll.setObjectName("sideScroll")
@@ -373,6 +373,24 @@ class MainWindow(QMainWindow):
         open_action.setShortcut(QKeySequence.Open)
         open_action.triggered.connect(self.choose_source)
         self.addAction(open_action)
+
+        self.next_box_action = QAction(self)
+        self.next_box_action.setShortcut(QKeySequence("Tab"))
+        self.next_box_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.next_box_action.setEnabled(False)
+        self.next_box_action.triggered.connect(
+            lambda: self._cycle_editor_box(1)
+        )
+        self.addAction(self.next_box_action)
+
+        self.previous_box_action = QAction(self)
+        self.previous_box_action.setShortcut(QKeySequence("Shift+Tab"))
+        self.previous_box_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.previous_box_action.setEnabled(False)
+        self.previous_box_action.triggered.connect(
+            lambda: self._cycle_editor_box(-1)
+        )
+        self.addAction(self.previous_box_action)
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -524,6 +542,8 @@ class MainWindow(QMainWindow):
         self.undo_button.setVisible(not editing)
         self.remove_box_button.setVisible(editing)
         self.export_button.setVisible(editing)
+        self.next_box_action.setEnabled(editing)
+        self.previous_box_action.setEnabled(editing)
         self.progress.setEnabled(editing)
         self.commit_button.setText(
             (
@@ -541,7 +561,8 @@ class MainWindow(QMainWindow):
         self.help_text.setText(
             (
                 "Click box: chon object   |   Keo/resize: sua box   |   "
-                "Keo vung trong: them box   |   Backspace: xoa box   |   A/D: anh truoc/sau"
+                "Tab/Shift+Tab: doi box   |   Keo vung trong: them box   |   "
+                "Backspace: xoa box   |   A/D: anh truoc/sau"
                 if editing
                 else "Keo chuot: tao bbox   |   Keo trong khung: di chuyen   |   "
                 "Keo diem vuong: resize   |   Wheel: zoom   |   Space+drag: pan   |   A/D: anh truoc/sau"
@@ -897,6 +918,23 @@ class MainWindow(QMainWindow):
             self._select_class_ui(annotations[index].class_id)
         self._update_object_status()
 
+    def _cycle_editor_box(self, delta: int) -> None:
+        if (
+            self.mode != "edit"
+            or self.busy
+            or not self.canvas.annotations
+        ):
+            return
+        self.canvas.cycle_active_annotation(delta)
+        self.canvas.setFocus()
+        self.statusBar().showMessage(
+            "Dang chon object {} / {}".format(
+                self.canvas.active_index + 1,
+                len(self.canvas.annotations),
+            ),
+            2000,
+        )
+
     def _update_object_status(self) -> None:
         if self.mode != "edit":
             return
@@ -1120,7 +1158,7 @@ class MainWindow(QMainWindow):
             return
         destination = QFileDialog.getExistingDirectory(
             self,
-            "Chon thu muc rong de export classification folder",
+            "Chon thu muc rong de xuat YOLO + classification",
             str(self.editor_index.root.parent),
         )
         if not destination:
@@ -1129,9 +1167,12 @@ class MainWindow(QMainWindow):
         if any(path.iterdir()):
             self._show_error("Thu muc export phai rong")
             return
-        self._set_busy(True, "Dang crop va export classification folder...")
+        self._set_busy(
+            True,
+            "Dang chia lai va xuat YOLO + classification...",
+        )
         task = FunctionTask(
-            export_classification_folder,
+            export_rebalanced_datasets,
             self.editor_index,
             path,
             self.crop_padding,
@@ -1145,10 +1186,14 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Export hoan tat",
-            "Da xuat {} crop tu {} anh.\nDich: {}".format(
+            (
+                "Da xuat {} crop va {} anh YOLO.\n"
+                "YOLO: {}\nClassification: {}"
+            ).format(
                 result.objects,
                 result.images,
-                result.destination,
+                result.destination / "dataset",
+                result.destination / "cls_crops",
             ),
         )
 
@@ -1408,12 +1453,6 @@ class MainWindow(QMainWindow):
             return
         if key == Qt.Key_D:
             self.navigate(1)
-            event.accept()
-            return
-        if key == Qt.Key_Tab and self.mode == "edit":
-            self.canvas.cycle_active_annotation(
-                -1 if event.modifiers() & Qt.ShiftModifier else 1
-            )
             event.accept()
             return
         if key == Qt.Key_Backspace and self.mode == "edit":

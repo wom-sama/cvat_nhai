@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from PIL import Image
+from PySide6.QtCore import Qt
 
 from cvat_nhai.main_window import MainWindow
 from cvat_nhai.models import BBox, YoloAnnotation
@@ -126,6 +127,17 @@ def test_yolo_editor_mode_loads_resets_saves_and_deletes(
         ),
         timeout=5000,
     )
+
+    starting_box = window.canvas.active_index
+    window.class_buttons[0].setFocus()
+    qtbot.keyClick(window.class_buttons[0], Qt.Key_Tab)
+    assert window.canvas.active_index == (starting_box + 1) % 2
+    qtbot.keyClick(
+        window.class_buttons[0],
+        Qt.Key_Tab,
+        modifier=Qt.ShiftModifier,
+    )
+    assert window.canvas.active_index == starting_box
 
     changed = (
         YoloAnnotation(2, BBox(20, 10, 180, 90)),

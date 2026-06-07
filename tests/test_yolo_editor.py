@@ -9,7 +9,7 @@ from cvat_nhai.utils import atomic_write_yaml, load_yaml, names_from_yaml
 from cvat_nhai.yolo_editor import (
     YoloDatasetEditor,
     YoloEditorError,
-    export_classification_folder,
+    export_rebalanced_datasets,
     read_yolo_annotations,
     scan_yolo_dataset,
     serialize_yolo_annotations,
@@ -212,7 +212,7 @@ def test_segmentation_rows_are_rejected_without_modification(
     assert label.read_text(encoding="utf-8") == original
 
 
-def test_export_classification_folder_uses_edited_labels(
+def test_export_rebalanced_datasets_uses_edited_labels(
     tmp_path: Path,
 ) -> None:
     root = make_yolo_dataset(tmp_path / "dataset")
@@ -228,7 +228,7 @@ def test_export_classification_folder_uses_edited_labels(
     destination = tmp_path / "classification"
     destination.mkdir()
 
-    report = export_classification_folder(
+    report = export_rebalanced_datasets(
         index,
         destination,
         crop_padding=0.0,
@@ -237,13 +237,14 @@ def test_export_classification_folder_uses_edited_labels(
     assert report.images == 2
     assert report.objects == 2
     assert report.class_counts == {2: 2}
-    crops = sorted(destination.rglob("*.jpg"))
+    classification = destination / "cls_crops"
+    detection = destination / "dataset"
+    crops = sorted(classification.rglob("*_box*.jpg"))
     assert len(crops) == 2
-    with Image.open(
-        destination / "train" / "bad" / "a_box000.jpg"
-    ) as crop:
+    a_crop = next(path for path in crops if path.name == "a_box000.jpg")
+    with Image.open(a_crop) as crop:
         assert crop.size == (100, 60)
-    with (destination / "manifest.csv").open(
+    with (classification / "manifest.csv").open(
         newline="",
         encoding="utf-8",
     ) as handle:
@@ -251,11 +252,236 @@ def test_export_classification_folder_uses_edited_labels(
     assert len(rows) == 2
     assert {row["class_name"] for row in rows} == {"bad"}
     assert tuple(
-        names_from_yaml(load_yaml(destination / "data.yaml"))
+        names_from_yaml(load_yaml(classification / "data.yaml"))
     ) == NAMES
+    assert tuple(
+        names_from_yaml(load_yaml(detection / "data.yaml"))
+    ) == NAMES
+    assert len(list(detection.rglob("*.txt"))) == 2
+    assert all(
+        line.startswith("2 ")
+        for label in detection.rglob("*.txt")
+        for line in label.read_text(encoding="utf-8").splitlines()
+    )
     for split in ("train", "val", "test"):
         for class_name in NAMES:
-            assert (destination / split / class_name).is_dir()
+            assert (classification / split / class_name).is_dir()
+        assert (detection / "images" / split).is_dir()
+        assert (detection / "labels" / split).is_dir()
+
+
+def test_export_stratifies_each_class_and_groups_duplicates(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "large_dataset"
+    for split in ("train", "val", "test"):
+        (root / "images" / split).mkdir(parents=True)
+        (root / "labels" / split).mkdir(parents=True)
+    atomic_write_yaml(
+        root / "data.yaml",
+        {
+            "path": str(root),
+            "train": "images/train",
+            "val": "images/val",
+            "test": "images/test",
+            "nc": len(NAMES),
+            "names": list(NAMES),
+        },
+    )
+
+    first_image = None
+    for class_id in range(len(NAMES)):
+        for item_index in range(10):
+            source_split = ("train", "val", "test")[item_index % 3]
+            image_path = (
+                root
+                / "images"
+                / source_split
+                / "c{}_{}.jpg".format(class_id, item_index)
+            )
+            image = Image.new("RGB", (32, 32))
+            image.putdata(
+                [
+                    (
+                        (x * 17 + item_index * 31 + class_id * 13) % 256,
+                        (y * 29 + item_index * 11 + class_id * 47) % 256,
+                        (
+                            x * 7
+                            + y * 19
+                            + item_index * 23
+                            + class_id * 59
+                        )
+                        % 256,
+                    )
+                    for y in range(32)
+                    for x in range(32)
+                ]
+            )
+            image.save(image_path, quality=98)
+            image_path.with_suffix(".txt").write_text(
+                "{} 0.500000 0.500000 0.750000 0.750000\n".format(
+                    class_id
+                ),
+                encoding="utf-8",
+            )
+            label_path = (
+                root
+                / "labels"
+                / source_split
+                / image_path.with_suffix(".txt").name
+            )
+            image_path.with_suffix(".txt").replace(label_path)
+            if class_id == 0 and item_index == 0:
+                first_image = image_path
+
+    duplicate = root / "images" / "test" / "duplicate_visual.jpg"
+    with Image.open(first_image) as source_image:
+        source_image.save(duplicate, quality=72)
+    (root / "labels" / "test" / "duplicate_visual.txt").write_text(
+        "0 0.500000 0.500000 0.750000 0.750000\n",
+        encoding="utf-8",
+    )
+
+    destination = tmp_path / "balanced_export"
+    report = export_rebalanced_datasets(
+        scan_yolo_dataset(root),
+        destination,
+        crop_padding=0.0,
+    )
+
+    assert report.images == 31
+    with (destination / "cls_crops" / "manifest.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    per_class = {
+        class_name: {
+            split: sum(
+                row["class_name"] == class_name
+                and row["split"] == split
+                for row in rows
+            )
+            for split in ("train", "val", "test")
+        }
+        for class_name in NAMES
+    }
+    for class_name, counts in per_class.items():
+        total = sum(counts.values())
+        assert all(counts[split] > 0 for split in counts), class_name
+        assert abs(counts["train"] / total - 0.7) <= 0.16
+        assert abs(counts["val"] / total - 0.2) <= 0.11
+        assert abs(counts["test"] / total - 0.1) <= 0.11
+
+    group_splits = {}
+    for row in rows:
+        group_splits.setdefault(row["leakage_group"], set()).add(
+            row["split"]
+        )
+    assert all(len(splits) == 1 for splits in group_splits.values())
+    duplicate_rows = [
+        row
+        for row in rows
+        if Path(row["source_image"]).name
+        in {"c0_0.jpg", "duplicate_visual.jpg"}
+    ]
+    assert len(duplicate_rows) == 2
+    assert len({row["split"] for row in duplicate_rows}) == 1
+    assert len({row["leakage_group"] for row in duplicate_rows}) == 1
+
+    with (destination / "dataset" / "manifest.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        detection_rows = list(csv.DictReader(handle))
+    detection_assignments = {
+        row["source_image"]: (
+            row["split"],
+            row["leakage_group"],
+        )
+        for row in detection_rows
+    }
+    assert len(detection_assignments) == 31
+    assert all(
+        detection_assignments[row["source_image"]]
+        == (row["split"], row["leakage_group"])
+        for row in rows
+    )
+    assert (
+        load_yaml(destination / "dataset" / "data.yaml")[
+            "split_strategy"
+        ]
+        == "stratified_group"
+    )
+    assert load_yaml(
+        destination / "cls_crops" / "stats.json"
+    )["source_groups"] == 30
+
+    second_destination = tmp_path / "balanced_export_again"
+    export_rebalanced_datasets(
+        scan_yolo_dataset(root),
+        second_destination,
+        crop_padding=0.0,
+    )
+    with (second_destination / "dataset" / "manifest.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        repeated_rows = list(csv.DictReader(handle))
+    assert {
+        row["source_image"]: row["split"] for row in repeated_rows
+    } == {
+        row["source_image"]: row["split"] for row in detection_rows
+    }
+
+
+def test_export_keeps_negative_images_in_yolo_dataset(
+    tmp_path: Path,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "dataset")
+    negative = root / "images" / "test" / "negative.jpg"
+    Image.new("RGB", (80, 60), "black").save(negative)
+    (root / "labels" / "test" / "negative.txt").write_text(
+        "",
+        encoding="utf-8",
+    )
+
+    destination = tmp_path / "export"
+    report = export_rebalanced_datasets(
+        scan_yolo_dataset(root),
+        destination,
+        crop_padding=0.0,
+    )
+
+    assert report.images == 3
+    assert report.objects == 3
+    with (destination / "dataset" / "manifest.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    negative_row = next(
+        row
+        for row in rows
+        if Path(row["source_image"]).name == negative.name
+    )
+    negative_label = Path(negative_row["output_label"])
+    assert negative_label.exists()
+    assert negative_label.read_text(encoding="utf-8") == ""
+    detection_balance = load_yaml(
+        destination / "dataset" / "canbang.yaml"
+    )["dataset_balance"]
+    classification_balance = load_yaml(
+        destination / "cls_crops" / "canbang.yaml"
+    )["dataset_balance"]
+    assert detection_balance["total_images"] == 3
+    assert classification_balance["total_images"] == 2
+    with (destination / "cls_crops" / "manifest.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        crop_rows = list(csv.DictReader(handle))
+    assert len(crop_rows) == 3
 
 
 def test_export_refuses_nonempty_destination(tmp_path: Path) -> None:
@@ -266,7 +492,20 @@ def test_export_refuses_nonempty_destination(tmp_path: Path) -> None:
     (destination / "keep.txt").write_text("do not overwrite", encoding="utf-8")
 
     with pytest.raises(YoloEditorError, match="phai rong"):
-        export_classification_folder(index, destination)
+        export_rebalanced_datasets(index, destination)
     assert (destination / "keep.txt").read_text(encoding="utf-8") == (
         "do not overwrite"
     )
+
+
+def test_export_refuses_destination_inside_source_dataset(
+    tmp_path: Path,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "dataset")
+    index = scan_yolo_dataset(root)
+    destination = root / "new_export"
+    destination.mkdir()
+
+    with pytest.raises(YoloEditorError, match="nam ngoai"):
+        export_rebalanced_datasets(index, destination)
+    assert not any(destination.iterdir())
