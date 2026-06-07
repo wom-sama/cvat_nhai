@@ -33,7 +33,7 @@ def _load_ui_font() -> None:
 def main() -> int:
     QCoreApplication.setOrganizationName(ORG_NAME)
     QCoreApplication.setApplicationName(APP_NAME)
-    QCoreApplication.setApplicationVersion("1.1.1")
+    QCoreApplication.setApplicationVersion("1.1.2")
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )

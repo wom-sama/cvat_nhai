@@ -1,4 +1,6 @@
 from PIL import Image, ImageDraw
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QDialog
 
 from cvat_nhai.export_progress_dialog import ExportProgressDialog
 from cvat_nhai.export_settings_dialog import (
@@ -56,3 +58,13 @@ def test_export_settings_dialog_updates_margin_preview_realtime(
     assert dialog.percent_label.text() == "25% moi canh"
     assert not dialog.cards[0].image_label.pixmap().isNull()
     assert dialog.cards[0].image_label.pixmap().cacheKey() != original_key
+
+
+def test_export_settings_continue_button_accepts_dialog(qtbot) -> None:
+    dialog = ExportSettingsDialog([], 0.08)
+    qtbot.addWidget(dialog)
+    dialog.show()
+
+    qtbot.mouseClick(dialog.continue_button, Qt.LeftButton)
+
+    assert dialog.result() == QDialog.DialogCode.Accepted

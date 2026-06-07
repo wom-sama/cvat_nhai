@@ -168,14 +168,17 @@ class ExportSettingsDialog(QDialog):
         for index, card in enumerate(self.cards):
             preview_grid.addWidget(card, index // 2, index % 2)
 
-        buttons = QDialogButtonBox(
+        self.button_box = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel
         )
-        buttons.button(QDialogButtonBox.Save).setText(
+        self.continue_button = self.button_box.button(
+            QDialogButtonBox.Save
+        )
+        self.continue_button.setText(
             "Tiep tuc chon thu muc xuat"
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
@@ -185,7 +188,7 @@ class ExportSettingsDialog(QDialog):
         layout.addLayout(control_row)
         layout.addLayout(sample_row)
         layout.addLayout(preview_grid)
-        layout.addWidget(buttons)
+        layout.addWidget(self.button_box)
 
         self.padding_slider.valueChanged.connect(
             self._slider_changed

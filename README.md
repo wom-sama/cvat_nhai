@@ -131,6 +131,8 @@ Truoc khi chon thu muc xuat, dialog `Cau hinh class_f` cho phep chinh margin
 tu `0%` den `50%` moi canh bbox. Bon crop ngau nhien duoc cap nhat truc tiep
 khi keo slider hoac sua o so; nut `Doi mau ngau nhien` chon cac bbox khac.
 Gia tri margin export duoc ghi nho rieng cho lan sau.
+Nut `Tiep tuc chon thu muc xuat` mo bo chon thu muc Qt ngay tren cua so chinh,
+tranh truong hop hop thoai native bi an phia sau tren Windows.
 
 Trong che do sua, `Tab` chon box ke tiep va `Shift+Tab` chon box truoc do,
 ke ca khi focus dang nam tren sidebar.

@@ -8,6 +8,7 @@ from PySide6.QtCore import QEvent, QSettings, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QImage, QImageReader, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -145,6 +146,7 @@ class MainWindow(QMainWindow):
         self.export_progress_dialog: Optional[
             ExportProgressDialog
         ] = None
+        self.export_destination_dialog: Optional[QFileDialog] = None
 
         self._build_ui()
         self._build_actions()
@@ -1207,21 +1209,82 @@ class MainWindow(QMainWindow):
             self.export_crop_padding,
             self,
         )
-        if preview_dialog.exec() != preview_dialog.Accepted:
+        preview_result = preview_dialog.exec()
+        if preview_result != QDialog.DialogCode.Accepted:
+            preview_dialog.deleteLater()
             return
         self.export_crop_padding = preview_dialog.crop_padding
         self.settings.setValue(
             "datasets/export_crop_padding",
             self.export_crop_padding,
         )
-        destination = QFileDialog.getExistingDirectory(
+        preview_dialog.deleteLater()
+        QTimer.singleShot(0, self._show_export_destination_dialog)
+
+    def _show_export_destination_dialog(self) -> None:
+        if self.mode != "edit" or self.editor_index is None or self.busy:
+            return
+        self._ensure_window_visible()
+        dialog = QFileDialog(
             self,
             "Chon thu muc rong de tao yolo_f + class_f",
             str(self.editor_index.root.parent),
         )
-        if not destination:
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setAcceptMode(QFileDialog.AcceptOpen)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.accepted.connect(
+            lambda value=dialog: self._export_destination_selected(value)
+        )
+        dialog.rejected.connect(self._export_destination_cancelled)
+        dialog.destroyed.connect(
+            lambda _object=None, value=dialog: (
+                self._export_destination_destroyed(value)
+            )
+        )
+        self.export_destination_dialog = dialog
+        dialog.open()
+        QTimer.singleShot(
+            0,
+            lambda value=dialog: self._raise_export_destination_dialog(value),
+        )
+
+    def _raise_export_destination_dialog(self, dialog: QFileDialog) -> None:
+        if self.export_destination_dialog is not dialog:
             return
-        path = Path(destination)
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _export_destination_selected(self, dialog: QFileDialog) -> None:
+        selected = dialog.selectedFiles()
+        self.export_destination_dialog = None
+        if not selected:
+            return
+        path = Path(selected[0])
+        QTimer.singleShot(
+            0,
+            lambda value=path: self._start_editor_export(value),
+        )
+
+    def _export_destination_cancelled(self) -> None:
+        self.export_destination_dialog = None
+        self._ensure_window_visible()
+
+    def _export_destination_destroyed(
+        self,
+        dialog: QFileDialog,
+    ) -> None:
+        if self.export_destination_dialog is dialog:
+            self.export_destination_dialog = None
+
+    def _start_editor_export(self, path: Path) -> None:
+        if self.mode != "edit" or self.editor_index is None or self.busy:
+            return
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
         if any(path.iterdir()):
             self._show_error("Thu muc export phai rong")
             return
@@ -1624,6 +1687,9 @@ class MainWindow(QMainWindow):
                 self.export_progress_dialog.request_cancel()
             event.ignore()
             return
+        if self.export_destination_dialog is not None:
+            self.export_destination_dialog.close()
+            self.export_destination_dialog = None
         self._stop_continuous_navigation()
         self.settings.sync()
         super().closeEvent(event)

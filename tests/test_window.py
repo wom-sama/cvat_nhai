@@ -4,8 +4,10 @@ from pathlib import Path
 from PIL import Image
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog
 
 import cvat_nhai.main_window as main_window_module
+from cvat_nhai.export_settings_dialog import ExportSettingsDialog
 from cvat_nhai.main_window import MainWindow
 from cvat_nhai.models import (
     BBox,
@@ -250,23 +252,19 @@ def test_export_dialog_reports_progress_without_blocking_ui(
     )
 
     class FakeExportSettingsDialog:
-        Accepted = 1
-
         def __init__(self, preview_items, initial_padding, parent=None):
             self.crop_padding = 0.23
 
         def exec(self):
-            return self.Accepted
+            return QDialog.DialogCode.Accepted
+
+        def deleteLater(self):
+            return None
 
     monkeypatch.setattr(
         main_window_module,
         "ExportSettingsDialog",
         FakeExportSettingsDialog,
-    )
-    monkeypatch.setattr(
-        main_window_module.QFileDialog,
-        "getExistingDirectory",
-        lambda *args: str(destination),
     )
     monkeypatch.setattr(
         main_window_module.QMessageBox,
@@ -284,6 +282,11 @@ def test_export_dialog_reports_progress_without_blocking_ui(
         data_yaml=tmp_path / "source" / "data.yaml",
         class_names=("class0",),
         samples=(),
+    )
+    monkeypatch.setattr(
+        window,
+        "_show_export_destination_dialog",
+        lambda: window._start_editor_export(destination),
     )
 
     heartbeats = []
@@ -309,6 +312,63 @@ def test_export_dialog_reports_progress_without_blocking_ui(
     assert used_padding == [0.23]
     assert window.export_crop_padding == 0.23
     assert float(window.settings.value("datasets/export_crop_padding")) == 0.23
+
+
+def test_export_continue_opens_visible_non_native_folder_picker(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.mode_combo.setCurrentIndex(1)
+    window.editor_index = YoloDatasetIndex(
+        root=tmp_path / "source",
+        data_yaml=tmp_path / "source" / "data.yaml",
+        class_names=("class0",),
+        samples=(),
+    )
+    clicked = []
+
+    def click_continue() -> None:
+        modal = QApplication.activeModalWidget()
+        if isinstance(modal, ExportSettingsDialog):
+            clicked.append(True)
+            qtbot.mouseClick(modal.continue_button, Qt.LeftButton)
+
+    QTimer.singleShot(0, click_continue)
+    window.export_editor_dataset()
+
+    qtbot.waitUntil(
+        lambda: (
+            window.export_destination_dialog is not None
+            and window.export_destination_dialog.isVisible()
+        ),
+        timeout=2000,
+    )
+    dialog = window.export_destination_dialog
+    assert clicked == [True]
+    assert isinstance(dialog, QFileDialog)
+    assert dialog.testOption(QFileDialog.DontUseNativeDialog)
+    assert dialog.fileMode() == QFileDialog.Directory
+    assert dialog.windowModality() == Qt.WindowModal
+    destination = tmp_path / "empty-export"
+    destination.mkdir()
+    started = []
+    monkeypatch.setattr(
+        window,
+        "_start_editor_export",
+        lambda path: started.append(path),
+    )
+    dialog.setDirectory(str(destination))
+    dialog.accept()
+    qtbot.waitUntil(lambda: bool(started), timeout=1000)
+    assert started == [destination]
+    qtbot.waitUntil(
+        lambda: window.export_destination_dialog is None,
+        timeout=1000,
+    )
 
 
 def test_yolo_editor_mode_loads_resets_saves_and_deletes(
