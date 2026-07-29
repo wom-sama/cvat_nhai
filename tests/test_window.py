@@ -14,6 +14,7 @@ from cvat_nhai.models import (
     ExportReport,
     YoloAnnotation,
     YoloDatasetIndex,
+    YoloSample,
 )
 from cvat_nhai.schema import audit_schema
 from cvat_nhai.utils import atomic_write_yaml
@@ -371,6 +372,86 @@ def test_export_continue_opens_visible_non_native_folder_picker(
     )
 
 
+def test_editor_export_uses_full_dataset_when_split_filter_is_active(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "source"
+    train_image = root / "images" / "train" / "a.jpg"
+    val_image = root / "images" / "val" / "b.jpg"
+    train_label = root / "labels" / "train" / "a.txt"
+    val_label = root / "labels" / "val" / "b.txt"
+    destination = tmp_path / "export"
+    destination.mkdir()
+    index = YoloDatasetIndex(
+        root=root,
+        data_yaml=root / "data.yaml",
+        class_names=("class0",),
+        samples=(
+            YoloSample(train_image, train_label, "train"),
+            YoloSample(val_image, val_label, "val"),
+        ),
+    )
+    exported_paths = []
+
+    def fake_export(
+        exported_index,
+        output,
+        crop_padding,
+        progress_callback=None,
+        cancel_event=None,
+    ):
+        exported_paths.append(
+            tuple(sample.image_path for sample in exported_index.samples)
+        )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "4/4 Dang ghi yolo_f va class_f",
+                    "detail": "done",
+                    "value": 1,
+                    "maximum": 1,
+                }
+            )
+        return ExportReport(
+            destination=Path(output),
+            images=2,
+            objects=2,
+            skipped=0,
+            class_counts={0: 2},
+        )
+
+    monkeypatch.setattr(
+        main_window_module,
+        "export_rebalanced_datasets",
+        fake_export,
+    )
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "information",
+        lambda *args: None,
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.mode_combo.setCurrentIndex(1)
+    window.editor_index = index
+    window.editor_manager = object()
+    window.editor_samples_by_path = {
+        sample.image_path: sample for sample in index.samples
+    }
+    window.editor_all_images = [train_image, val_image]
+    window._set_editor_split_filter_ui("val")
+    window.images = [val_image]
+
+    window._start_editor_export(destination)
+    qtbot.waitUntil(lambda: not window.busy, timeout=3000)
+
+    assert exported_paths == [(train_image, val_image)]
+
+
 def test_yolo_editor_mode_loads_resets_saves_and_deletes(
     qtbot,
     tmp_path: Path,
@@ -490,6 +571,143 @@ def test_yolo_editor_mode_loads_resets_saves_and_deletes(
         ),
         timeout=5000,
     )
+
+
+def test_yolo_editor_shows_and_filters_dataset_splits(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "split_yolo"
+    for split in ("train", "val", "test"):
+        (root / "images" / split).mkdir(parents=True)
+        (root / "labels" / split).mkdir(parents=True)
+    atomic_write_yaml(
+        root / "data.yaml",
+        {
+            "path": str(root),
+            "train": "images/train",
+            "val": "images/val",
+            "test": "images/test",
+            "nc": 2,
+            "names": ["green", "ripe"],
+        },
+    )
+    train_image = root / "images" / "train" / "train_a.jpg"
+    val_image = root / "images" / "val" / "val_b.jpg"
+    Image.new("RGB", (180, 120), "green").save(train_image)
+    Image.new("RGB", (160, 120), "orange").save(val_image)
+    (root / "labels" / "train" / "train_a.txt").write_text(
+        "0 0.500000 0.500000 0.500000 0.500000\n",
+        encoding="utf-8",
+    )
+    val_label = root / "labels" / "val" / "val_b.txt"
+    val_label.write_text(
+        "1 0.500000 0.500000 0.500000 0.500000\n",
+        encoding="utf-8",
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.mode_combo.setCurrentIndex(1)
+    window.source_edit.setText(str(root))
+    window.scan_source()
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == train_image
+            and len(window.canvas.annotations) == 1
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert window.editor_split_filter_combo.isVisible()
+    assert window.editor_split_status.text().startswith(
+        "Split hien tai: TRAIN"
+    )
+    assert window.queue_label.text() == "2 anh dataset"
+
+    window.editor_split_filter_combo.setCurrentIndex(
+        window.editor_split_filter_combo.findData("val")
+    )
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == val_image
+            and len(window.images) == 1
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert window.editor_split_status.text().startswith(
+        "Split hien tai: VAL"
+    )
+    assert window.queue_label.text() == "1 anh val / 2 tong"
+    assert window.progress.maximum() == 0
+
+    window.editor_split_filter_combo.setCurrentIndex(
+        window.editor_split_filter_combo.findData("test")
+    )
+    qtbot.waitUntil(lambda: window.current_path is None, timeout=1000)
+    assert window.images == []
+    assert window.file_label.text() == "Khong co anh trong split TEST"
+    assert window.queue_label.text() == "0 anh test / 2 tong"
+    assert window.editor_split_status.text() == "Split hien tai: -"
+
+    window.editor_split_filter_combo.setCurrentIndex(
+        window.editor_split_filter_combo.findData("all")
+    )
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == train_image
+            and len(window.canvas.annotations) == 1
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    window.canvas.set_annotations(
+        (YoloAnnotation(1, BBox(20, 20, 120, 90)),),
+        0,
+    )
+    window.editor_split_filter_combo.setCurrentIndex(
+        window.editor_split_filter_combo.findData("val")
+    )
+    assert window.editor_split_filter == "all"
+    assert window.editor_split_filter_combo.currentData() == "all"
+    assert window.current_path == train_image
+
+    window.reset_annotation()
+    window.editor_split_filter_combo.setCurrentIndex(
+        window.editor_split_filter_combo.findData("val")
+    )
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == val_image
+            and len(window.canvas.annotations) == 1
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    window.delete_current()
+    qtbot.waitUntil(
+        lambda: (
+            len(window.editor_all_images) == 1
+            and not val_image.exists()
+            and not val_label.exists()
+            and window.current_path is None
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert window.queue_label.text() == "0 anh val / 1 tong"
+    assert val_image not in window.editor_samples_by_path
+
+    window.editor_split_filter_combo.setCurrentIndex(
+        window.editor_split_filter_combo.findData("all")
+    )
+    qtbot.waitUntil(
+        lambda: window.current_path == train_image,
+        timeout=5000,
+    )
+    assert window.images == [train_image]
 
 
 def test_yolo_editor_loads_tiny_box_and_selects_largest(
