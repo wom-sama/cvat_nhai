@@ -41,6 +41,7 @@ class AnnotationCanvas(QWidget):
         self._current_class_id = 0
         self._class_name = ""
         self._class_color = QColor("#22C55E")
+        self._annotation_enabled = True
         self._zoom = 1.0
         self._pan = QPointF(0.0, 0.0)
         self._space_down = False
@@ -205,6 +206,18 @@ class AnnotationCanvas(QWidget):
         self._class_color = QColor(color)
         if class_id is not None:
             self._current_class_id = class_id
+        self.update()
+
+    def set_annotation_enabled(self, enabled: bool) -> None:
+        self._annotation_enabled = bool(enabled)
+        if not self._annotation_enabled:
+            self._bbox = None
+            self._annotations = []
+            self._active_index = -1
+            self._multi_mode = False
+            self.bbox_changed.emit(None)
+            self.active_annotation_changed.emit(-1)
+            self.annotations_changed.emit(())
         self.update()
 
     def fit_to_view(self) -> None:
@@ -468,6 +481,8 @@ class AnnotationCanvas(QWidget):
             return
 
         self.setFocus()
+        if not self._annotation_enabled:
+            return
         handle = self._hit_handle(point)
         self._start_widget = point
         self._start_image = self._widget_to_image(point)

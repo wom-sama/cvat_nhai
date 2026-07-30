@@ -121,6 +121,22 @@ class YoloDatasetIndex:
 
 
 @dataclass(frozen=True)
+class ClassificationSample:
+    image_path: Path
+    split: str
+    class_id: int
+    class_name: str
+
+
+@dataclass(frozen=True)
+class ClassificationDatasetIndex:
+    root: Path
+    data_yaml: Optional[Path]
+    class_names: Tuple[str, ...]
+    samples: Tuple[ClassificationSample, ...]
+
+
+@dataclass(frozen=True)
 class ExportReport:
     destination: Path
     images: int

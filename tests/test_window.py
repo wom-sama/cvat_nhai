@@ -1,3 +1,4 @@
+import csv
 import time
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from cvat_nhai.models import (
     YoloSample,
 )
 from cvat_nhai.schema import audit_schema
-from cvat_nhai.utils import atomic_write_yaml
+from cvat_nhai.utils import atomic_write_yaml, load_yaml
 
 
 def test_main_window_smoke(qtbot) -> None:
@@ -845,6 +846,143 @@ def test_yolo_editor_filters_by_class_and_updates_after_save(
         timeout=5000,
     )
     assert train_image not in window.images
+
+
+def test_classification_folder_mode_filters_and_changes_class_safely(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "class_f"
+    names = ("green", "ripe", "bad")
+    for split in ("train", "val", "test"):
+        for name in names:
+            (root / split / name).mkdir(parents=True)
+    atomic_write_yaml(
+        root / "data.yaml",
+        {
+            "format": "classification_folder",
+            "path": ".",
+            "train": "train",
+            "val": "val",
+            "test": "test",
+            "nc": len(names),
+            "names": {index: name for index, name in enumerate(names)},
+        },
+    )
+    green_image = root / "train" / "green" / "a.jpg"
+    ripe_image = root / "train" / "ripe" / "b.jpg"
+    bad_image = root / "val" / "bad" / "c.jpg"
+    Image.new("RGB", (80, 60), "green").save(green_image)
+    Image.new("RGB", (80, 60), "orange").save(ripe_image)
+    Image.new("RGB", (80, 60), "red").save(bad_image)
+    with (root / "manifest.csv").open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "split",
+                "source_image",
+                "output_image",
+                "class_id",
+                "class_name",
+                "source",
+            ]
+        )
+        writer.writerow(["train", "raw/a.jpg", str(green_image), 0, "green", 0])
+        writer.writerow(["train", "raw/b.jpg", str(ripe_image), 1, "ripe", 0])
+        writer.writerow(["val", "raw/c.jpg", str(bad_image), 2, "bad", 0])
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.mode_combo.setCurrentIndex(window.mode_combo.findData("class_edit"))
+    assert window.export_button.isHidden()
+    assert window.remove_box_button.isHidden()
+    assert not window.canvas._annotation_enabled
+    window.source_edit.setText(str(root))
+    window.scan_source()
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == green_image
+            and not window.active_tasks
+            and not window.canvas.is_loading
+        ),
+        timeout=5000,
+    )
+
+    assert window.queue_label.text() == "3 anh class_f"
+    assert "Class hien tai: class 1 (green)" in window.editor_split_status.text()
+    assert "Class: class 1 (green) -> class 1 (green)" in window.bbox_label.text()
+
+    window.select_class(1)
+    assert window._classification_is_dirty()
+    assert "CHUA LUU" in window.bbox_label.text()
+    assert not window.navigate(1)
+    window.editor_class_filter_combo.setCurrentIndex(
+        window.editor_class_filter_combo.findData(1)
+    )
+    assert window.editor_class_filter == "all"
+    assert window.editor_class_filter_combo.currentData() == "all"
+
+    window.reset_annotation()
+    assert window.selected_class == 0
+    window.select_class(1)
+    window.commit_current()
+    moved_image = root / "train" / "ripe" / "a.jpg"
+    qtbot.waitUntil(
+        lambda: (
+            not green_image.exists()
+            and moved_image.exists()
+            and window.current_path == ripe_image
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert window.classification_samples_by_path[moved_image].class_id == 1
+    with (root / "manifest.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    changed_row = next(row for row in rows if row["source_image"] == "raw/a.jpg")
+    assert changed_row["output_image"] == str(moved_image)
+    assert changed_row["class_id"] == "1"
+
+    window.editor_class_filter_combo.setCurrentIndex(
+        window.editor_class_filter_combo.findData(0)
+    )
+    qtbot.waitUntil(lambda: window.current_path is None, timeout=1000)
+    assert window.queue_label.text() == "0 anh class 1 (green) / 3 tong"
+
+    window.editor_class_filter_combo.setCurrentIndex(
+        window.editor_class_filter_combo.findData(1)
+    )
+    qtbot.waitUntil(
+        lambda: (
+            sorted(path.name for path in window.images) == ["a.jpg", "b.jpg"]
+            and window.current_path is not None
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    current_to_delete = window.current_path
+    window.delete_current()
+    qtbot.waitUntil(
+        lambda: (
+            current_to_delete not in window.classification_samples_by_path
+            and not current_to_delete.exists()
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert list((root / ".cvat_nhai_classification_archive").rglob("*.jpg"))
+    balance = load_yaml(root / "canbang.yaml")["dataset_balance"]
+    assert balance["total_objects"] == 2
+    assert balance["classes"]["0"]["count"] == 0
+    assert balance["classes"]["1"]["count"] == 1
 
 
 def test_yolo_editor_loads_tiny_box_and_selects_largest(

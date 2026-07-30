@@ -143,6 +143,32 @@ nhan YOLO da luu tren dia; anh co nhieu bbox se xuat hien trong tat ca class co
 trong label. Hai bo loc nay chi doi danh sach anh dang duyet de dieu tra data
 leak; export van dung toan bo dataset YOLO da chinh sua tren dia.
 
+## Kiem tra va sua class_f
+
+Chon che do `Kiem tra / sua class_f`, sau do chon thu muc `class_f` hoac thu
+muc cha co thu muc con `class_f`. Tool doc `data.yaml` neu co, neu khong se
+dung schema 5 lop mac dinh, roi quet layout:
+
+```text
+class_f\<split>\<class_name>\*.jpg
+```
+
+Moi anh crop duoc hien kem split va class hien tai suy ra tu thu muc. Chon
+class moi bang phim `1` den `5` hoac nut class, nhan `Enter` de ap dung. Tool
+chi di chuyen anh trong cung split sang thu muc class moi, khong doi train/val/
+test, va cap nhat `manifest.csv`, `canbang.yaml`, `stats.json`, `data.yaml`.
+Neu ten file da ton tai trong class dich, tool tao ten phu `__classeditNNN`
+thay vi ghi de.
+
+`F` dua class dang chon ve class goc cua anh hien tai. `Delete` dua anh crop
+vao `class_f\.cvat_nhai_classification_archive` va xoa dong tu manifest neu
+co. Khi class chua luu, app chan chuyen anh, keo thanh tien do va doi bo loc de
+tranh lam roi anh vao class sai do thao tac nhanh.
+
+Che do nay dung chung bo loc split va class voi YOLO editor. Bo loc class_f dua
+tren class thu muc hien tai cua anh crop; sau khi `Enter` hoac `Delete`, danh
+sach dang xem duoc tinh lai ngay.
+
 Crop classification duoc mo rong theo `crop_padding`, sau do resize giu
 nguyen ty le va letterbox thanh dung `640x640` (mau nen RGB 114). Khong keo
 gian crop theo hai chieu nen hinh dang vat the khong bi meo.
