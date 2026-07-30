@@ -1,4 +1,5 @@
 import csv
+import shutil
 from pathlib import Path
 
 import pytest
@@ -378,3 +379,110 @@ def test_classification_editor_handles_rapid_chained_operations(
         class_id: balance["classes"][str(class_id)]["count"]
         for class_id in range(3)
     } == {0: 1, 1: 1, 2: 1}
+
+
+def test_relocated_classification_manifest_updates_existing_row(
+    tmp_path: Path,
+) -> None:
+    original = _make_classification_dataset(tmp_path / "original" / "class_f")
+    relocated = tmp_path / "relocated" / "class_f"
+    shutil.copytree(original, relocated)
+    manifest = relocated / "manifest.csv"
+    original_manifest = manifest.read_bytes()
+    index = scan_classification_dataset(relocated)
+    sample = next(
+        item for item in index.samples if item.image_path.name == "a.jpg"
+    )
+    editor = ClassificationDatasetEditor(index)
+
+    changed = editor.change_class(sample, 1)
+
+    with manifest.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 3
+    matching = [row for row in rows if row["source_image"] == "raw/a.jpg"]
+    assert len(matching) == 1
+    assert matching[0]["output_image"] == str(changed.image_path)
+    assert matching[0]["class_id"] == "1"
+    assert editor.undo_latest() is not None
+    assert sample.image_path.exists()
+    assert manifest.read_bytes() == original_manifest
+
+
+def test_relocated_classification_manifest_delete_and_undo_are_exact(
+    tmp_path: Path,
+) -> None:
+    original = _make_classification_dataset(tmp_path / "original" / "class_f")
+    relocated = tmp_path / "relocated" / "class_f"
+    shutil.copytree(original, relocated)
+    manifest = relocated / "manifest.csv"
+    original_manifest = manifest.read_bytes()
+    index = scan_classification_dataset(relocated)
+    sample = next(
+        item for item in index.samples if item.image_path.name == "c.jpg"
+    )
+    editor = ClassificationDatasetEditor(index)
+
+    archive = editor.delete_sample(sample)
+
+    with manifest.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 2
+    assert all(row["source_image"] != "raw/c.jpg" for row in rows)
+    restored = editor.undo_latest()
+    assert restored is not None
+    assert restored.sample == sample
+    assert sample.image_path.exists()
+    assert not archive.exists()
+    assert manifest.read_bytes() == original_manifest
+
+
+def test_classification_move_uses_unique_name_and_undo_preserves_collision(
+    tmp_path: Path,
+) -> None:
+    root = _make_classification_dataset(tmp_path / "class_f")
+    collision = root / "train" / "ripe" / "a.jpg"
+    collision_bytes = b"existing-target"
+    collision.write_bytes(collision_bytes)
+    index = scan_classification_dataset(root)
+    sample = next(
+        item
+        for item in index.samples
+        if item.image_path == root / "train" / "green" / "a.jpg"
+    )
+    editor = ClassificationDatasetEditor(index)
+
+    changed = editor.change_class(sample, 1)
+
+    assert changed.image_path.name == "a__classedit001.jpg"
+    assert collision.read_bytes() == collision_bytes
+    assert editor.undo_latest() is not None
+    assert sample.image_path.exists()
+    assert collision.read_bytes() == collision_bytes
+
+
+def test_relative_classification_manifest_path_stays_relative(
+    tmp_path: Path,
+) -> None:
+    root = _make_classification_dataset(tmp_path / "class_f")
+    manifest = root / "manifest.csv"
+    with manifest.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+        fieldnames = list(rows[0])
+    rows[0]["output_image"] = "train/green/a.jpg"
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    index = scan_classification_dataset(root)
+    sample = next(
+        item for item in index.samples if item.image_path.name == "a.jpg"
+    )
+
+    changed = ClassificationDatasetEditor(index).change_class(sample, 1)
+
+    with manifest.open(newline="", encoding="utf-8") as handle:
+        updated = list(csv.DictReader(handle))
+    row = next(item for item in updated if item["source_image"] == "raw/a.jpg")
+    assert Path(row["output_image"]) == Path("train/ripe/a.jpg")
+    assert changed.image_path.exists()

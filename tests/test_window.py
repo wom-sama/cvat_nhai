@@ -611,8 +611,8 @@ def test_yolo_editor_mode_loads_resets_saves_and_deletes(
     window.undo_button.click()
     qtbot.waitUntil(
         lambda: (
-            first_label.read_text(encoding="utf-8").startswith("0 ")
-            and not window.active_tasks
+            not window.active_tasks
+            and first_label.read_text(encoding="utf-8").startswith("0 ")
         ),
         timeout=5000,
     )
