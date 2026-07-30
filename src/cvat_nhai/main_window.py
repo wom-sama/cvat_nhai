@@ -1,7 +1,7 @@
 from collections import OrderedDict
 from pathlib import Path
 import random
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PIL import Image, ImageOps
 from PySide6.QtCore import QEvent, QSettings, Qt, QThreadPool, QTimer, Signal
@@ -129,6 +129,8 @@ class MainWindow(QMainWindow):
         self.editor_samples_by_path = {}
         self.editor_all_images: List[Path] = []
         self.editor_split_filter = "all"
+        self.editor_class_filter = "all"
+        self.editor_image_classes: Dict[Path, frozenset[int]] = {}
         self.editor_original_annotations = ()
         self.images: List[Path] = []
         self.current_index = 0
@@ -290,6 +292,22 @@ class MainWindow(QMainWindow):
         )
         self.editor_split_filter_combo.setVisible(False)
         side.addWidget(self.editor_split_filter_combo)
+
+        self.editor_class_filter_label = QLabel("XEM THEO CLASS")
+        self.editor_class_filter_label.setObjectName("sectionLabel")
+        self.editor_class_filter_label.setVisible(False)
+        side.addWidget(self.editor_class_filter_label)
+        self.editor_class_filter_combo = QComboBox()
+        self.editor_class_filter_combo.addItem("Tat ca class", "all")
+        self.editor_class_filter_combo.setToolTip(
+            "Chi loc danh sach dang xem theo class co trong label YOLO da "
+            "luu; cac nut class ben duoi van dung de sua nhan."
+        )
+        self.editor_class_filter_combo.currentIndexChanged.connect(
+            self._editor_class_filter_changed
+        )
+        self.editor_class_filter_combo.setVisible(False)
+        side.addWidget(self.editor_class_filter_combo)
 
         self.export_button = QPushButton(
             "Xuat yolo_f + class_f"
@@ -572,7 +590,9 @@ class MainWindow(QMainWindow):
         self.editor_manager = None
         self.editor_samples_by_path = {}
         self.editor_all_images = []
+        self.editor_image_classes = {}
         self._set_editor_split_filter_ui("all")
+        self._set_editor_class_filter_ui("all")
         self.editor_original_annotations = ()
         self.image_cache.clear()
         self.canvas.clear_image()
@@ -606,6 +626,8 @@ class MainWindow(QMainWindow):
         self.editor_split_status.setVisible(editing)
         self.editor_split_filter_label.setVisible(editing)
         self.editor_split_filter_combo.setVisible(editing)
+        self.editor_class_filter_label.setVisible(editing)
+        self.editor_class_filter_combo.setVisible(editing)
         self.undo_button.setVisible(not editing)
         self.remove_box_button.setVisible(editing)
         self.export_button.setVisible(editing)
@@ -665,6 +687,53 @@ class MainWindow(QMainWindow):
             CLASS_COLORS[: len(self.active_class_names)],
         )
         self.selected_class = -1
+
+    def _configure_editor_class_filter(self, names) -> None:
+        current = self.editor_class_filter
+        combo = self.editor_class_filter_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Tat ca class", "all")
+        for index, name in enumerate(names):
+            label = (
+                CLASS_LABELS[index]
+                if tuple(names) == CLASS_NAMES
+                else str(name)
+            )
+            combo.addItem(
+                "{}  {}".format(index + 1, label),
+                index,
+            )
+        selected_index = combo.findData(current)
+        if selected_index < 0:
+            selected_index = combo.findData("all")
+            current = "all"
+        combo.setCurrentIndex(selected_index)
+        combo.blockSignals(False)
+        self.editor_class_filter = current
+
+    def _read_sample_class_ids(self, sample) -> frozenset[int]:
+        if self.editor_index is None:
+            return frozenset()
+        try:
+            lines = sample.label_path.read_text(
+                encoding="utf-8-sig"
+            ).splitlines()
+        except OSError:
+            return frozenset()
+        class_ids = set()
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            parts = stripped.split()
+            try:
+                class_id = int(parts[0])
+            except (IndexError, ValueError):
+                continue
+            if 0 <= class_id < len(self.editor_index.class_names):
+                class_ids.add(class_id)
+        return frozenset(class_ids)
 
     def choose_destination(self) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -788,10 +857,16 @@ class MainWindow(QMainWindow):
             sample.image_path: sample for sample in result.samples
         }
         self._configure_class_buttons(result.class_names)
+        self._configure_editor_class_filter(result.class_names)
         self.editor_all_images = [
             sample.image_path for sample in result.samples
         ]
+        self.editor_image_classes = {
+            sample.image_path: self._read_sample_class_ids(sample)
+            for sample in result.samples
+        }
         self._set_editor_split_filter_ui("all")
+        self._set_editor_class_filter_ui("all")
         self.images = list(self.editor_all_images)
         self.current_index = 0
         self.image_cache.clear()
@@ -846,8 +921,8 @@ class MainWindow(QMainWindow):
             self.canvas.clear_image()
             if self.mode == "edit":
                 self.file_label.setText(
-                    "Khong co anh trong split {}".format(
-                        self._split_title(self.editor_split_filter)
+                    "Khong co anh trong bo loc {}".format(
+                        self._editor_filter_title()
                     )
                 )
             else:
@@ -975,6 +1050,9 @@ class MainWindow(QMainWindow):
             self.editor_original_annotations = ()
             self._show_error(str(error))
             return
+        self.editor_image_classes[path] = frozenset(
+            annotation.class_id for annotation in annotations
+        )
         self.editor_original_annotations = annotations
         active_index = (
             max(
@@ -1178,21 +1256,35 @@ class MainWindow(QMainWindow):
             height,
         )
         task.signals.succeeded.connect(
-            lambda _, saved=annotations: self._editor_save_finished(saved)
+            lambda _, value=sample.image_path, saved=annotations: (
+                self._editor_save_finished(value, saved)
+            )
         )
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(lambda: self._set_busy(False))
         self._start_task(task)
 
-    def _editor_save_finished(self, annotations) -> None:
+    def _editor_save_finished(self, path: Path, annotations) -> None:
+        visible_before = list(self.images)
+        try:
+            saved_index = visible_before.index(path)
+        except ValueError:
+            saved_index = self.current_index
+        next_path = (
+            visible_before[saved_index + 1]
+            if saved_index + 1 < len(visible_before)
+            else path
+        )
+        self.editor_image_classes[path] = frozenset(
+            annotation.class_id for annotation in annotations
+        )
         self.editor_original_annotations = tuple(annotations)
         self.statusBar().showMessage(
             "Da ap dung {} object vao label".format(len(annotations)),
             4000,
         )
-        if self.current_index + 1 < len(self.images):
-            self.current_index += 1
-            self.show_current()
+        if self.mode == "edit":
+            self._apply_editor_filters(next_path, fallback_index=saved_index)
 
     def delete_current(self) -> None:
         if self.busy or self.current_path is None:
@@ -1598,6 +1690,7 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(not busy)
         self.remove_box_button.setEnabled(not busy)
         self.editor_split_filter_combo.setEnabled(not busy)
+        self.editor_class_filter_combo.setEnabled(not busy)
         if message:
             self.statusBar().showMessage(message)
         if busy:
@@ -1622,6 +1715,25 @@ class MainWindow(QMainWindow):
         combo.blockSignals(False)
         self.editor_split_filter = split
 
+    def _set_editor_class_filter_ui(self, class_filter) -> None:
+        if class_filter != "all":
+            try:
+                class_filter = int(class_filter)
+            except (TypeError, ValueError):
+                class_filter = "all"
+        combo = getattr(self, "editor_class_filter_combo", None)
+        if combo is None:
+            self.editor_class_filter = class_filter
+            return
+        index = combo.findData(class_filter)
+        if index < 0:
+            index = combo.findData("all")
+            class_filter = "all"
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+        self.editor_class_filter = class_filter
+
     def _editor_split_filter_changed(self) -> None:
         if self.mode != "edit":
             return
@@ -1641,29 +1753,86 @@ class MainWindow(QMainWindow):
             )
             return
         self.editor_split_filter = requested
-        self._apply_editor_split_filter(self.current_path)
+        self._apply_editor_filters(self.current_path)
+
+    def _editor_class_filter_changed(self) -> None:
+        if self.mode != "edit":
+            return
+        requested = self.editor_class_filter_combo.currentData()
+        if requested != "all":
+            try:
+                requested = int(requested)
+            except (TypeError, ValueError):
+                requested = "all"
+        if requested == self.editor_class_filter:
+            return
+        if self.busy:
+            self._set_editor_class_filter_ui(self.editor_class_filter)
+            return
+        if self._editor_is_dirty():
+            self._set_editor_class_filter_ui(self.editor_class_filter)
+            self.statusBar().showMessage(
+                "Nhan Enter de luu hoac F de bo thay doi truoc khi loc class",
+                5000,
+            )
+            return
+        self.editor_class_filter = requested
+        self._apply_editor_filters(self.current_path)
 
     def _split_title(self, split: str) -> str:
         if split == "all":
             return "tat ca"
         return split.upper()
 
-    def _editor_filter_images(self, split: str) -> List[Path]:
-        if split == "all":
-            return list(self.editor_all_images)
-        return [
-            path
-            for path in self.editor_all_images
-            if self.editor_samples_by_path.get(path) is not None
-            and self.editor_samples_by_path[path].split == split
-        ]
+    def _class_filter_title(self, class_filter) -> str:
+        if class_filter == "all":
+            return "tat ca class"
+        class_id = int(class_filter)
+        if 0 <= class_id < len(self.active_class_names):
+            return "class {} ({})".format(
+                class_id + 1,
+                self.active_class_names[class_id],
+            )
+        return "class {}".format(class_id + 1)
+
+    def _editor_filter_title(self) -> str:
+        parts = []
+        if self.editor_split_filter != "all":
+            parts.append(self._split_title(self.editor_split_filter))
+        if self.editor_class_filter != "all":
+            parts.append(self._class_filter_title(self.editor_class_filter))
+        return " + ".join(parts) if parts else "tat ca"
+
+    def _editor_filter_images(self) -> List[Path]:
+        result = []
+        for path in self.editor_all_images:
+            sample = self.editor_samples_by_path.get(path)
+            if sample is None:
+                continue
+            if (
+                self.editor_split_filter != "all"
+                and sample.split != self.editor_split_filter
+            ):
+                continue
+            if self.editor_class_filter != "all":
+                class_id = int(self.editor_class_filter)
+                if class_id not in self.editor_image_classes.get(
+                    path,
+                    frozenset(),
+                ):
+                    continue
+            result.append(path)
+        return result
 
     def _editor_queue_text(self) -> str:
-        if self.editor_split_filter == "all":
+        if (
+            self.editor_split_filter == "all"
+            and self.editor_class_filter == "all"
+        ):
             return "{} anh dataset".format(len(self.images))
         return "{} anh {} / {} tong".format(
             len(self.images),
-            self.editor_split_filter,
+            self._editor_filter_title(),
             len(self.editor_all_images),
         )
 
@@ -1675,9 +1844,9 @@ class MainWindow(QMainWindow):
             self.editor_split_status.setText("Split hien tai: -")
             return
         self.editor_split_status.setText(
-            "Split hien tai: {} | Dang xem: {}".format(
+            "Split hien tai: {} | Bo loc: {}".format(
                 sample.split.upper(),
-                self._split_title(self.editor_split_filter),
+                self._editor_filter_title(),
             )
         )
 
@@ -1687,21 +1856,23 @@ class MainWindow(QMainWindow):
             value for value in self.editor_all_images if value != path
         ]
         self.images = [value for value in self.images if value != path]
+        self.editor_image_classes.pop(path, None)
 
-    def _apply_editor_split_filter(
+    def _apply_editor_filters(
         self,
         preferred_path: Optional[Path] = None,
+        fallback_index: int = 0,
     ) -> None:
         if self.mode != "edit":
             return
-        self.images = self._editor_filter_images(self.editor_split_filter)
+        self.images = self._editor_filter_images()
         if not self.images:
             self.current_index = 0
             self.current_path = None
             self.canvas.clear_image()
             self.file_label.setText(
-                "Khong co anh trong split {}".format(
-                    self._split_title(self.editor_split_filter)
+                "Khong co anh trong bo loc {}".format(
+                    self._editor_filter_title()
                 )
             )
             self.path_label.clear()
@@ -1712,16 +1883,17 @@ class MainWindow(QMainWindow):
             self.editor_original_annotations = ()
             self._update_editor_split_status()
             self.statusBar().showMessage(
-                "Bo loc {} khong co anh".format(
-                    self._split_title(self.editor_split_filter)
-                ),
+                "Bo loc {} khong co anh".format(self._editor_filter_title()),
                 4000,
             )
             return
         if preferred_path in self.images:
             self.current_index = self.images.index(preferred_path)
         else:
-            self.current_index = 0
+            self.current_index = min(
+                max(0, fallback_index),
+                len(self.images) - 1,
+            )
         self.show_current()
 
     def _ensure_window_visible(self) -> None:

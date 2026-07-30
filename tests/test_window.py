@@ -640,7 +640,7 @@ def test_yolo_editor_shows_and_filters_dataset_splits(
     assert window.editor_split_status.text().startswith(
         "Split hien tai: VAL"
     )
-    assert window.queue_label.text() == "1 anh val / 2 tong"
+    assert window.queue_label.text() == "1 anh VAL / 2 tong"
     assert window.progress.maximum() == 0
 
     window.editor_split_filter_combo.setCurrentIndex(
@@ -648,8 +648,8 @@ def test_yolo_editor_shows_and_filters_dataset_splits(
     )
     qtbot.waitUntil(lambda: window.current_path is None, timeout=1000)
     assert window.images == []
-    assert window.file_label.text() == "Khong co anh trong split TEST"
-    assert window.queue_label.text() == "0 anh test / 2 tong"
+    assert window.file_label.text() == "Khong co anh trong bo loc TEST"
+    assert window.queue_label.text() == "0 anh TEST / 2 tong"
     assert window.editor_split_status.text() == "Split hien tai: -"
 
     window.editor_split_filter_combo.setCurrentIndex(
@@ -697,7 +697,7 @@ def test_yolo_editor_shows_and_filters_dataset_splits(
         ),
         timeout=5000,
     )
-    assert window.queue_label.text() == "0 anh val / 1 tong"
+    assert window.queue_label.text() == "0 anh VAL / 1 tong"
     assert val_image not in window.editor_samples_by_path
 
     window.editor_split_filter_combo.setCurrentIndex(
@@ -708,6 +708,143 @@ def test_yolo_editor_shows_and_filters_dataset_splits(
         timeout=5000,
     )
     assert window.images == [train_image]
+
+
+def test_yolo_editor_filters_by_class_and_updates_after_save(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "class_filter_yolo"
+    for split in ("train", "val", "test"):
+        (root / "images" / split).mkdir(parents=True)
+        (root / "labels" / split).mkdir(parents=True)
+    atomic_write_yaml(
+        root / "data.yaml",
+        {
+            "path": str(root),
+            "train": "images/train",
+            "val": "images/val",
+            "test": "images/test",
+            "nc": 2,
+            "names": ["green", "ripe"],
+        },
+    )
+    train_image = root / "images" / "train" / "mix.jpg"
+    val_image = root / "images" / "val" / "ripe.jpg"
+    test_image = root / "images" / "test" / "green.jpg"
+    Image.new("RGB", (200, 120), "green").save(train_image)
+    Image.new("RGB", (180, 120), "orange").save(val_image)
+    Image.new("RGB", (160, 120), "yellow").save(test_image)
+    train_label = root / "labels" / "train" / "mix.txt"
+    train_label.write_text(
+        "0 0.250000 0.500000 0.300000 0.500000\n"
+        "1 0.750000 0.500000 0.300000 0.500000\n",
+        encoding="utf-8",
+    )
+    (root / "labels" / "val" / "ripe.txt").write_text(
+        "1 0.500000 0.500000 0.500000 0.500000\n",
+        encoding="utf-8",
+    )
+    (root / "labels" / "test" / "green.txt").write_text(
+        "0 0.500000 0.500000 0.500000 0.500000\n",
+        encoding="utf-8",
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.mode_combo.setCurrentIndex(1)
+    window.source_edit.setText(str(root))
+    window.scan_source()
+    qtbot.waitUntil(
+        lambda: (
+            window.editor_index is not None
+            and window.current_path is not None
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+
+    assert window.editor_class_filter_combo.findData(1) >= 0
+    window.editor_class_filter_combo.setCurrentIndex(
+        window.editor_class_filter_combo.findData(1)
+    )
+    qtbot.waitUntil(
+        lambda: (
+            len(window.images) == 2
+            and train_image in window.images
+            and val_image in window.images
+            and test_image not in window.images
+            and window.current_path == train_image
+            and len(window.canvas.annotations) == 2
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert "class 2" in window.queue_label.text()
+    assert window.editor_split_status.text().endswith("class 2 (ripe)")
+
+    window.canvas.set_annotations(
+        (YoloAnnotation(0, BBox(20, 20, 120, 90)),),
+        0,
+    )
+    window.editor_class_filter_combo.setCurrentIndex(
+        window.editor_class_filter_combo.findData("all")
+    )
+    assert window.editor_class_filter == 1
+    assert window.editor_class_filter_combo.currentData() == 1
+    window.reset_annotation()
+
+    window.editor_split_filter_combo.setCurrentIndex(
+        window.editor_split_filter_combo.findData("train")
+    )
+    qtbot.waitUntil(
+        lambda: (
+            window.images == [train_image]
+            and window.current_path == train_image
+            and len(window.canvas.annotations) == 2
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    window.canvas.set_annotations(
+        (
+            YoloAnnotation(0, BBox(20, 30, 80, 90)),
+            YoloAnnotation(0, BBox(120, 30, 180, 90)),
+        ),
+        0,
+    )
+    window.commit_current()
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path is None
+            and not window.images
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+
+    assert window.editor_image_classes[train_image] == frozenset({0})
+    assert all(
+        line.startswith("0 ")
+        for line in train_label.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    )
+    assert "class 2" in window.queue_label.text()
+
+    window.editor_split_filter_combo.setCurrentIndex(
+        window.editor_split_filter_combo.findData("all")
+    )
+    qtbot.waitUntil(
+        lambda: (
+            window.images == [val_image]
+            and window.current_path == val_image
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert train_image not in window.images
 
 
 def test_yolo_editor_loads_tiny_box_and_selects_largest(

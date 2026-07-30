@@ -138,9 +138,10 @@ Trong che do sua, `Tab` chon box ke tiep va `Shift+Tab` chon box truoc do,
 ke ca khi focus dang nam tren sidebar.
 
 Che do sua hien `Split hien tai` cua anh dang xem va co bo loc `Tat ca`,
-`train`, `val`, `test` ngay canh thanh tien do. Bo loc nay chi doi danh sach
-anh dang duyet de dieu tra data leak; export van dung toan bo dataset YOLO da
-chinh sua tren dia.
+`train`, `val`, `test` ngay canh thanh tien do. Ben duoi la bo loc class theo
+nhan YOLO da luu tren dia; anh co nhieu bbox se xuat hien trong tat ca class co
+trong label. Hai bo loc nay chi doi danh sach anh dang duyet de dieu tra data
+leak; export van dung toan bo dataset YOLO da chinh sua tren dia.
 
 Crop classification duoc mo rong theo `crop_padding`, sau do resize giu
 nguyen ty le va letterbox thanh dung `640x640` (mau nen RGB 114). Khong keo
