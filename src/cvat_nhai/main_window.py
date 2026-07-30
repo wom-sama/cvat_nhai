@@ -48,7 +48,14 @@ from .export_settings_dialog import (
     ExportSettingsDialog,
 )
 from .migration import apply_migration
-from .models import BBox, ClassificationSample, DatasetPaths, MigrationReport
+from .models import (
+    BBox,
+    ClassificationSample,
+    ClassificationUndoResult,
+    DatasetPaths,
+    MigrationReport,
+    YoloUndoResult,
+)
 from .scanner import scan_images
 from .schema import audit_schema, initialize_empty_datasets
 from .seek_slider import SeekSlider
@@ -460,6 +467,12 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status)
         self.statusBar().showMessage("San sang")
         self.busy_overlay = BusyOverlay(root)
+        self.busy_overlay_message = ""
+        self.busy_overlay_timer = QTimer(self)
+        self.busy_overlay_timer.setSingleShot(True)
+        self.busy_overlay_timer.timeout.connect(
+            self._show_delayed_busy_overlay
+        )
 
     def _build_actions(self) -> None:
         open_action = QAction(self)
@@ -667,7 +680,7 @@ class MainWindow(QMainWindow):
         self.editor_split_filter_combo.setVisible(filterable)
         self.editor_class_filter_label.setVisible(filterable)
         self.editor_class_filter_combo.setVisible(filterable)
-        self.undo_button.setVisible(not filterable)
+        self.undo_button.setVisible(True)
         self.remove_box_button.setVisible(editing)
         self.export_button.setVisible(editing)
         self.next_box_action.setEnabled(editing)
@@ -710,12 +723,14 @@ class MainWindow(QMainWindow):
             (
                 "Click box: chon object   |   Keo/resize: sua box   |   "
                 "Tab/Shift+Tab: doi box   |   Keo vung trong: them box   |   "
-                "Backspace: xoa box   |   Giu A/D: anh truoc/sau"
+                "Backspace: xoa box   |   Ctrl+Z: hoan tac   |   "
+                "Giu A/D: anh truoc/sau"
                 if editing
                 else (
                     "Phim 1-5: doi class   |   ENTER: ap dung   |   "
                     "F: ve class goc   |   DEL: xoa anh   |   "
-                    "Wheel: zoom   |   Space+drag: pan   |   Giu A/D: anh truoc/sau"
+                    "Ctrl+Z: hoan tac   |   Wheel: zoom   |   "
+                    "Space+drag: pan   |   Giu A/D: anh truoc/sau"
                     if classification_editing
                     else "Keo chuot: tao bbox   |   Keo trong khung: di chuyen   |   "
                     "Keo diem vuong: resize   |   Wheel: zoom   |   Space+drag: pan   |   Giu A/D: anh truoc/sau"
@@ -1225,6 +1240,8 @@ class MainWindow(QMainWindow):
         self._update_classification_status()
 
     def select_class(self, class_id: int) -> None:
+        if self.busy:
+            return
         if not 0 <= class_id < len(self.active_class_names):
             return
         self._select_class_ui(class_id)
@@ -1461,7 +1478,20 @@ class MainWindow(QMainWindow):
             return
         width, height = self.canvas.image_size
         annotations = self.canvas.annotations
-        self._set_busy(True, "Dang backup va ghi label YOLO...")
+        if tuple(annotations) == tuple(self.editor_original_annotations):
+            if self.navigate(1):
+                self.statusBar().showMessage(
+                    "Nhan khong doi; da chuyen sang anh tiep theo",
+                    3000,
+                )
+            else:
+                self.statusBar().showMessage("Nhan khong doi", 3000)
+            return
+        self._set_busy(
+            True,
+            "Dang backup va ghi label YOLO...",
+            delayed_overlay=True,
+        )
         task = FunctionTask(
             self.editor_manager.save_annotations,
             sample,
@@ -1521,7 +1551,11 @@ class MainWindow(QMainWindow):
             return
         path = self.current_path
         class_id = self.selected_class
-        self._set_busy(True, "Dang doi class va cap nhat class_f...")
+        self._set_busy(
+            True,
+            "Dang doi class va cap nhat class_f...",
+            delayed_overlay=True,
+        )
         task = FunctionTask(
             self.classification_manager.change_class,
             sample,
@@ -1594,7 +1628,11 @@ class MainWindow(QMainWindow):
             return
         width, height = self.canvas.image_size
         path = self.current_path
-        self._set_busy(True, "Dang archive anh va label...")
+        self._set_busy(
+            True,
+            "Dang archive anh va label...",
+            delayed_overlay=True,
+        )
         task = FunctionTask(
             self.editor_manager.delete_sample,
             sample,
@@ -1628,7 +1666,11 @@ class MainWindow(QMainWindow):
         if sample is None:
             return
         path = self.current_path
-        self._set_busy(True, "Dang archive anh va cap nhat class_f...")
+        self._set_busy(
+            True,
+            "Dang archive anh va cap nhat class_f...",
+            delayed_overlay=True,
+        )
         task = FunctionTask(
             self.classification_manager.delete_sample,
             sample,
@@ -1892,9 +1934,33 @@ class MainWindow(QMainWindow):
     def undo_latest(self) -> None:
         if self.busy:
             return
-        self._set_busy(True, "Dang hoan tac...")
-        task = FunctionTask(self.manager.undo_latest)
-        task.signals.succeeded.connect(self._undo_finished)
+        if self._current_edit_is_dirty():
+            self.reset_annotation()
+            self.statusBar().showMessage(
+                "Da hoan tac thay doi chua luu cua anh hien tai",
+                3500,
+            )
+            return
+        if self.mode == "edit":
+            if self.editor_manager is None:
+                return
+            function = self.editor_manager.undo_latest
+            callback = self._editor_undo_finished
+        elif self.mode == "class_edit":
+            if self.classification_manager is None:
+                return
+            function = self.classification_manager.undo_latest
+            callback = self._classification_undo_finished
+        else:
+            function = self.manager.undo_latest
+            callback = self._undo_finished
+        self._set_busy(
+            True,
+            "Dang hoan tac...",
+            delayed_overlay=self.mode in ("edit", "class_edit"),
+        )
+        task = FunctionTask(function)
+        task.signals.succeeded.connect(callback)
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(lambda: self._set_busy(False))
         self._start_task(task)
@@ -1907,6 +1973,68 @@ class MainWindow(QMainWindow):
             self.show_current()
         else:
             self.statusBar().showMessage("Khong co thao tac de hoan tac", 3000)
+
+    def _editor_undo_finished(self, result: object) -> None:
+        if not isinstance(result, YoloUndoResult):
+            self.statusBar().showMessage(
+                "Khong co thao tac sua YOLO de hoan tac",
+                3000,
+            )
+            return
+        sample = result.sample
+        path = sample.image_path
+        self.editor_samples_by_path[path] = sample
+        if path not in self.editor_all_images:
+            self.editor_all_images.append(path)
+            self.editor_all_images.sort(
+                key=lambda value: str(value).casefold()
+            )
+        self.editor_image_classes[path] = frozenset(
+            annotation.class_id for annotation in result.annotations
+        )
+        self.statusBar().showMessage(
+            (
+                "Da hoan tac xoa va phuc hoi anh + label YOLO"
+                if result.action == "delete_yolo"
+                else "Da hoan tac lan sua label YOLO gan nhat"
+            ),
+            4500,
+        )
+        if self.mode == "edit":
+            self._apply_editor_filters(path, fallback_index=self.current_index)
+
+    def _classification_undo_finished(self, result: object) -> None:
+        if not isinstance(result, ClassificationUndoResult):
+            self.statusBar().showMessage(
+                "Khong co thao tac class_f de hoan tac",
+                3000,
+            )
+            return
+        sample = result.sample
+        if result.action == "change_classification":
+            replaced_path = result.replaced_path
+            if replaced_path is not None:
+                self._replace_classification_sample(replaced_path, sample)
+        else:
+            self.classification_samples_by_path[sample.image_path] = sample
+            if sample.image_path not in self.classification_all_images:
+                self.classification_all_images.append(sample.image_path)
+                self.classification_all_images.sort(
+                    key=self._classification_path_sort_key
+                )
+        self.statusBar().showMessage(
+            (
+                "Da hoan tac xoa va phuc hoi anh class_f"
+                if result.action == "delete_classification"
+                else "Da hoan tac lan doi class gan nhat"
+            ),
+            4500,
+        )
+        if self.mode == "class_edit":
+            self._apply_classification_filters(
+                sample.image_path,
+                fallback_index=self.current_index,
+            )
 
     def navigate(self, delta: int) -> bool:
         if self.busy or not self.images:
@@ -1998,26 +2126,46 @@ class MainWindow(QMainWindow):
                 )
             )
 
-    def _set_busy(self, busy: bool, message: str = "") -> None:
+    def _set_busy(
+        self,
+        busy: bool,
+        message: str = "",
+        delayed_overlay: bool = False,
+    ) -> None:
         self.busy = busy
         if busy:
             self._stop_continuous_navigation()
         self.commit_button.setEnabled(not busy)
         self.delete_button.setEnabled(not busy)
         self.reset_button.setEnabled(not busy)
+        self.undo_button.setEnabled(not busy)
         self.scan_button.setEnabled(not busy)
         self.mode_combo.setEnabled(not busy)
         self.export_button.setEnabled(not busy)
         self.remove_box_button.setEnabled(not busy)
         self.editor_split_filter_combo.setEnabled(not busy)
         self.editor_class_filter_combo.setEnabled(not busy)
+        self.canvas.setEnabled(not busy)
+        for button in self.class_buttons:
+            button.setEnabled(not busy)
         if message:
             self.statusBar().showMessage(message)
         if busy:
             self._ensure_window_visible()
-            self.busy_overlay.show_message(message)
+            self.busy_overlay_message = message
+            self.busy_overlay_timer.stop()
+            if delayed_overlay:
+                self.busy_overlay_timer.start(180)
+            else:
+                self.busy_overlay.show_message(message)
         else:
+            self.busy_overlay_timer.stop()
+            self.busy_overlay_message = ""
             self.busy_overlay.hide()
+
+    def _show_delayed_busy_overlay(self) -> None:
+        if self.busy:
+            self.busy_overlay.show_message(self.busy_overlay_message)
 
     def _set_editor_split_filter_ui(self, split: str) -> None:
         if split not in ("all", *SPLITS):
@@ -2183,6 +2331,16 @@ class MainWindow(QMainWindow):
         ]
         self.images = [value for value in self.images if value != path]
         self.editor_image_classes.pop(path, None)
+
+    def _classification_path_sort_key(self, path: Path):
+        sample = self.classification_samples_by_path.get(path)
+        if sample is None:
+            return len(SPLITS), len(self.active_class_names), str(path).casefold()
+        return (
+            SPLITS.index(sample.split),
+            sample.class_id,
+            str(path).casefold(),
+        )
 
     def _classification_filter_images(self) -> List[Path]:
         result = []
@@ -2477,6 +2635,13 @@ class MainWindow(QMainWindow):
                 self.export_progress_dialog.request_cancel()
             event.ignore()
             return
+        if self.busy:
+            self.statusBar().showMessage(
+                "Dang hoan tat giao dich du lieu; vui long doi trong giay lat",
+                3000,
+            )
+            event.ignore()
+            return
         if self.export_destination_dialog is not None:
             self.export_destination_dialog.close()
             self.export_destination_dialog = None
@@ -2503,8 +2668,7 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
             return
         if key == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
-            if self.mode == "label":
-                self.undo_latest()
+            self.undo_latest()
             event.accept()
             return
         if Qt.Key_1 <= key <= Qt.Key_5:

@@ -47,6 +47,23 @@ def make_yolo_dataset(root: Path) -> Path:
                     "1": {"count": 1},
                     "2": {"count": 1},
                 },
+                "splits": {
+                    "train": {
+                        "total_images": 1,
+                        "total_objects": 2,
+                        "classes": {"0": 1, "1": 1, "2": 0},
+                    },
+                    "val": {
+                        "total_images": 1,
+                        "total_objects": 1,
+                        "classes": {"0": 0, "1": 0, "2": 1},
+                    },
+                    "test": {
+                        "total_images": 0,
+                        "total_objects": 0,
+                        "classes": {"0": 0, "1": 0, "2": 0},
+                    },
+                },
             }
         },
     )
@@ -136,6 +153,11 @@ def test_save_annotations_backs_up_and_updates_balance(tmp_path: Path) -> None:
     assert balance["classes"]["0"]["count"] == 0
     assert balance["classes"]["1"]["count"] == 0
     assert balance["classes"]["2"]["count"] == 2
+    assert balance["splits"]["train"]["classes"] == {
+        "0": 0,
+        "1": 0,
+        "2": 1,
+    }
 
 
 def test_save_rolls_back_label_when_metadata_update_fails(
@@ -199,6 +221,98 @@ def test_delete_rolls_back_files_when_metadata_update_fails(
 
     assert sample.image_path.exists()
     assert sample.label_path.exists()
+
+
+def test_yolo_editor_undoes_label_edit_and_delete(tmp_path: Path) -> None:
+    root = make_yolo_dataset(tmp_path / "dataset")
+    index = scan_yolo_dataset(root)
+    editor = YoloDatasetEditor(index)
+    train_sample = index.samples[0]
+    original_label = train_sample.label_path.read_bytes()
+    changed = (YoloAnnotation(2, BBox(20, 10, 180, 90)),)
+
+    editor.save_annotations(train_sample, changed, 200, 100)
+    edit_undo = editor.undo_latest()
+
+    assert edit_undo is not None
+    assert edit_undo.action == "edit_yolo"
+    assert edit_undo.sample == train_sample
+    assert train_sample.label_path.read_bytes() == original_label
+    assert len(edit_undo.annotations) == 2
+    balance = load_yaml(root / "canbang.yaml")["dataset_balance"]
+    assert balance["classes"]["0"]["count"] == 1
+    assert balance["classes"]["1"]["count"] == 1
+    assert balance["classes"]["2"]["count"] == 1
+    assert balance["splits"]["train"]["classes"] == {
+        "0": 1,
+        "1": 1,
+        "2": 0,
+    }
+
+    val_sample = index.samples[1]
+    original_val_label = val_sample.label_path.read_bytes()
+    editor.delete_sample(val_sample, 120, 120)
+    delete_undo = editor.undo_latest()
+
+    assert delete_undo is not None
+    assert delete_undo.action == "delete_yolo"
+    assert delete_undo.sample == val_sample
+    assert val_sample.image_path.exists()
+    assert val_sample.label_path.read_bytes() == original_val_label
+    balance = load_yaml(root / "canbang.yaml")["dataset_balance"]
+    assert balance["total_images"] == 2
+    assert balance["total_objects"] == 3
+    assert editor.undo_latest() is None
+
+
+def test_yolo_undo_refuses_to_overwrite_external_label_change(
+    tmp_path: Path,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "dataset")
+    index = scan_yolo_dataset(root)
+    editor = YoloDatasetEditor(index)
+    sample = index.samples[0]
+    editor.save_annotations(
+        sample,
+        (YoloAnnotation(2, BBox(20, 10, 180, 90)),),
+        200,
+        100,
+    )
+    external = "1 0.500000 0.500000 0.500000 0.500000\n"
+    sample.label_path.write_text(external, encoding="utf-8")
+
+    with pytest.raises(YoloEditorError, match="ben ngoai"):
+        editor.undo_latest()
+
+    assert sample.label_path.read_text(encoding="utf-8") == external
+
+
+def test_yolo_undo_rolls_back_label_if_metadata_update_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "dataset")
+    index = scan_yolo_dataset(root)
+    editor = YoloDatasetEditor(index)
+    sample = index.samples[0]
+    editor.save_annotations(
+        sample,
+        (YoloAnnotation(2, BBox(20, 10, 180, 90)),),
+        200,
+        100,
+    )
+    changed_label = sample.label_path.read_bytes()
+    changed_balance = (root / "canbang.yaml").read_bytes()
+
+    def fail_update(*args, **kwargs):
+        raise OSError("balance locked during undo")
+
+    monkeypatch.setattr(editor, "_update_balance", fail_update)
+    with pytest.raises(OSError, match="balance locked during undo"):
+        editor.undo_latest()
+
+    assert sample.label_path.read_bytes() == changed_label
+    assert (root / "canbang.yaml").read_bytes() == changed_balance
 
 
 def test_segmentation_rows_are_rejected_without_modification(

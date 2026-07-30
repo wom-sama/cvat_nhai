@@ -33,6 +33,31 @@ def test_main_window_smoke(qtbot) -> None:
     assert window.class_buttons[4].isChecked()
 
 
+def test_short_operations_delay_overlay_but_long_operations_show_it(
+    qtbot,
+) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+
+    window._set_busy(True, "quick", delayed_overlay=True)
+    assert not window.busy_overlay.isVisible()
+    assert not window.undo_button.isEnabled()
+    assert not window.canvas.isEnabled()
+    assert all(not button.isEnabled() for button in window.class_buttons)
+    window._set_busy(False)
+    qtbot.wait(220)
+    assert not window.busy_overlay.isVisible()
+
+    window._set_busy(True, "slow", delayed_overlay=True)
+    qtbot.waitUntil(window.busy_overlay.isVisible, timeout=1000)
+    window._set_busy(False)
+    assert not window.busy_overlay.isVisible()
+    assert window.undo_button.isEnabled()
+    assert window.canvas.isEnabled()
+    assert all(button.isEnabled() for button in window.class_buttons)
+
+
 def test_scan_keeps_workers_alive_and_displays_first_image(
     qtbot,
     tmp_path: Path,
@@ -492,6 +517,7 @@ def test_yolo_editor_mode_loads_resets_saves_and_deletes(
     qtbot.addWidget(window)
     window.show()
     window.mode_combo.setCurrentIndex(1)
+    assert window.undo_button.isVisible()
     window.source_edit.setText(str(root))
     window.scan_source()
     qtbot.waitUntil(
@@ -540,7 +566,7 @@ def test_yolo_editor_mode_loads_resets_saves_and_deletes(
     window.seek_to_index(0)
     assert window.current_path == current_before_navigation
     assert window.progress.value() == window.current_index
-    window.reset_annotation()
+    qtbot.keyClick(window, Qt.Key_Z, modifier=Qt.ControlModifier)
     assert window.canvas.annotations[0].class_id == 2
 
     window.seek_to_index(0)
@@ -568,6 +594,24 @@ def test_yolo_editor_mode_loads_resets_saves_and_deletes(
             len(window.images) == 1
             and not second_image.exists()
             and not second_label.exists()
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    qtbot.keyClick(window, Qt.Key_Z, modifier=Qt.ControlModifier)
+    qtbot.waitUntil(
+        lambda: (
+            len(window.images) == 2
+            and second_image.exists()
+            and second_label.exists()
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    window.undo_button.click()
+    qtbot.waitUntil(
+        lambda: (
+            first_label.read_text(encoding="utf-8").startswith("0 ")
             and not window.active_tasks
         ),
         timeout=5000,
@@ -901,6 +945,7 @@ def test_classification_folder_mode_filters_and_changes_class_safely(
     window.mode_combo.setCurrentIndex(window.mode_combo.findData("class_edit"))
     assert window.export_button.isHidden()
     assert window.remove_box_button.isHidden()
+    assert window.undo_button.isVisible()
     assert not window.canvas._annotation_enabled
     window.source_edit.setText(str(root))
     window.scan_source()
@@ -927,7 +972,7 @@ def test_classification_folder_mode_filters_and_changes_class_safely(
     assert window.editor_class_filter == "all"
     assert window.editor_class_filter_combo.currentData() == "all"
 
-    window.reset_annotation()
+    qtbot.keyClick(window, Qt.Key_Z, modifier=Qt.ControlModifier)
     assert window.selected_class == 0
     window.select_class(1)
     window.commit_current()
@@ -983,6 +1028,19 @@ def test_classification_folder_mode_filters_and_changes_class_safely(
     assert balance["total_objects"] == 2
     assert balance["classes"]["0"]["count"] == 0
     assert balance["classes"]["1"]["count"] == 1
+
+    qtbot.keyClick(window, Qt.Key_Z, modifier=Qt.ControlModifier)
+    qtbot.waitUntil(
+        lambda: (
+            current_to_delete in window.classification_samples_by_path
+            and current_to_delete.exists()
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    balance = load_yaml(root / "canbang.yaml")["dataset_balance"]
+    assert balance["total_objects"] == 3
+    assert balance["classes"]["1"]["count"] == 2
 
 
 def test_yolo_editor_loads_tiny_box_and_selects_largest(
