@@ -1,4 +1,5 @@
 import csv
+import shutil
 import threading
 from pathlib import Path
 
@@ -83,6 +84,48 @@ def make_yolo_dataset(root: Path) -> Path:
         encoding="utf-8",
     )
     return root
+
+
+def write_yolo_manifest(
+    root: Path,
+    output_root: Path = None,
+    duplicate_b: bool = False,
+) -> Path:
+    output_root = output_root or root
+    rows = [
+        {
+            "split": "train",
+            "source_split": "raw",
+            "leakage_group": "group-a",
+            "source_image": "raw/a.jpg",
+            "output_image": str(
+                output_root / "images" / "train" / "a.jpg"
+            ),
+            "output_label": str(
+                output_root / "labels" / "train" / "a.txt"
+            ),
+        },
+        {
+            "split": "val",
+            "source_split": "raw",
+            "leakage_group": "group-b",
+            "source_image": "raw/b.jpg",
+            "output_image": str(
+                output_root / "images" / "val" / "b.jpg"
+            ),
+            "output_label": str(
+                output_root / "labels" / "val" / "b.txt"
+            ),
+        },
+    ]
+    if duplicate_b:
+        rows.append(dict(rows[1]))
+    path = root / "manifest.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
 
 
 def test_scan_and_round_trip_multiple_yolo_boxes(tmp_path: Path) -> None:
@@ -313,6 +356,276 @@ def test_yolo_undo_rolls_back_label_if_metadata_update_fails(
 
     assert sample.label_path.read_bytes() == changed_label
     assert (root / "canbang.yaml").read_bytes() == changed_balance
+
+
+def test_relocated_yolo_manifest_delete_and_undo_are_exact(
+    tmp_path: Path,
+) -> None:
+    original = make_yolo_dataset(tmp_path / "original" / "yolo_f")
+    write_yolo_manifest(original)
+    relocated = tmp_path / "relocated" / "yolo_f"
+    shutil.copytree(original, relocated)
+    payload = load_yaml(relocated / "data.yaml")
+    payload["path"] = "."
+    atomic_write_yaml(relocated / "data.yaml", payload)
+    manifest = relocated / "manifest.csv"
+    original_manifest = manifest.read_bytes()
+    index = scan_yolo_dataset(relocated)
+    sample = next(item for item in index.samples if item.image_path.name == "b.jpg")
+    editor = YoloDatasetEditor(index)
+
+    editor.delete_sample(sample, 120, 120)
+
+    with manifest.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["source_image"] == "raw/a.jpg"
+    restored = editor.undo_latest()
+    assert restored is not None
+    assert restored.sample == sample
+    assert sample.image_path.exists()
+    assert sample.label_path.exists()
+    assert manifest.read_bytes() == original_manifest
+
+
+def test_yolo_delete_rolls_back_manifest_and_balance_on_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    manifest = write_yolo_manifest(root)
+    index = scan_yolo_dataset(root)
+    sample = next(item for item in index.samples if item.image_path.name == "b.jpg")
+    editor = YoloDatasetEditor(index)
+    original_manifest = manifest.read_bytes()
+    original_balance = (root / "canbang.yaml").read_bytes()
+
+    def fail_update(*args, **kwargs):
+        raise OSError("balance unavailable")
+
+    monkeypatch.setattr(editor, "_update_balance", fail_update)
+    with pytest.raises(OSError, match="balance unavailable"):
+        editor.delete_sample(sample, 120, 120)
+
+    assert sample.image_path.exists()
+    assert sample.label_path.exists()
+    assert manifest.read_bytes() == original_manifest
+    assert (root / "canbang.yaml").read_bytes() == original_balance
+
+
+def test_yolo_delete_rolls_back_if_journal_commit_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    manifest = write_yolo_manifest(root)
+    index = scan_yolo_dataset(root)
+    sample = next(item for item in index.samples if item.image_path.name == "b.jpg")
+    editor = YoloDatasetEditor(index)
+    original_manifest = manifest.read_bytes()
+    original_balance = (root / "canbang.yaml").read_bytes()
+
+    def fail_journal(*args, **kwargs):
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(editor.journal, "append", fail_journal)
+    with pytest.raises(OSError, match="journal unavailable"):
+        editor.delete_sample(sample, 120, 120)
+
+    assert sample.image_path.exists()
+    assert sample.label_path.exists()
+    assert manifest.read_bytes() == original_manifest
+    assert (root / "canbang.yaml").read_bytes() == original_balance
+
+
+def test_yolo_save_rolls_back_if_journal_commit_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    index = scan_yolo_dataset(root)
+    sample = next(
+        item for item in index.samples if item.image_path.name == "a.jpg"
+    )
+    editor = YoloDatasetEditor(index)
+    original_label = sample.label_path.read_bytes()
+    original_balance = (root / "canbang.yaml").read_bytes()
+
+    def fail_journal(*args, **kwargs):
+        raise OSError("journal unavailable")
+
+    monkeypatch.setattr(editor.journal, "append", fail_journal)
+    with pytest.raises(OSError, match="journal unavailable"):
+        editor.save_annotations(
+            sample,
+            (YoloAnnotation(2, BBox(20, 10, 180, 90)),),
+            200,
+            100,
+        )
+
+    assert sample.label_path.read_bytes() == original_label
+    assert (root / "canbang.yaml").read_bytes() == original_balance
+
+
+def test_yolo_delete_rolls_back_if_manifest_write_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    manifest = write_yolo_manifest(root)
+    index = scan_yolo_dataset(root)
+    sample = next(
+        item for item in index.samples if item.image_path.name == "b.jpg"
+    )
+    editor = YoloDatasetEditor(index)
+    original_manifest = manifest.read_bytes()
+    original_balance = (root / "canbang.yaml").read_bytes()
+
+    def fail_manifest_write():
+        raise OSError("manifest unavailable")
+
+    monkeypatch.setattr(editor, "_write_manifest_state", fail_manifest_write)
+    with pytest.raises(OSError, match="manifest unavailable"):
+        editor.delete_sample(sample, 120, 120)
+
+    assert sample.image_path.exists()
+    assert sample.label_path.exists()
+    assert manifest.read_bytes() == original_manifest
+    assert (root / "canbang.yaml").read_bytes() == original_balance
+
+
+def test_yolo_undo_delete_failure_keeps_deleted_state_exact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    manifest = write_yolo_manifest(root)
+    index = scan_yolo_dataset(root)
+    sample = next(item for item in index.samples if item.image_path.name == "b.jpg")
+    editor = YoloDatasetEditor(index)
+    editor.delete_sample(sample, 120, 120)
+    deleted_manifest = manifest.read_bytes()
+    deleted_balance = (root / "canbang.yaml").read_bytes()
+
+    def fail_update(*args, **kwargs):
+        raise OSError("balance locked during undo")
+
+    monkeypatch.setattr(editor, "_update_balance", fail_update)
+    with pytest.raises(OSError, match="balance locked during undo"):
+        editor.undo_latest()
+
+    assert not sample.image_path.exists()
+    assert not sample.label_path.exists()
+    assert manifest.read_bytes() == deleted_manifest
+    assert (root / "canbang.yaml").read_bytes() == deleted_balance
+
+
+def test_yolo_undo_delete_journal_failure_keeps_deleted_state_exact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    manifest = write_yolo_manifest(root)
+    index = scan_yolo_dataset(root)
+    sample = next(
+        item for item in index.samples if item.image_path.name == "b.jpg"
+    )
+    editor = YoloDatasetEditor(index)
+    editor.delete_sample(sample, 120, 120)
+    deleted_manifest = manifest.read_bytes()
+    deleted_balance = (root / "canbang.yaml").read_bytes()
+
+    def fail_journal(*args, **kwargs):
+        raise OSError("undo journal unavailable")
+
+    monkeypatch.setattr(editor.journal, "append", fail_journal)
+    with pytest.raises(OSError, match="undo journal unavailable"):
+        editor.undo_latest()
+
+    assert not sample.image_path.exists()
+    assert not sample.label_path.exists()
+    assert manifest.read_bytes() == deleted_manifest
+    assert (root / "canbang.yaml").read_bytes() == deleted_balance
+
+
+def test_yolo_editor_refuses_stale_external_manifest(
+    tmp_path: Path,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    manifest = write_yolo_manifest(root)
+    index = scan_yolo_dataset(root)
+    sample = next(item for item in index.samples if item.image_path.name == "b.jpg")
+    editor = YoloDatasetEditor(index)
+    with manifest.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    with pytest.raises(YoloEditorError, match="ben ngoai"):
+        editor.delete_sample(sample, 120, 120)
+
+    assert sample.image_path.exists()
+    assert sample.label_path.exists()
+
+
+def test_yolo_delete_removes_duplicate_manifest_rows_and_undo_restores_order(
+    tmp_path: Path,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    manifest = write_yolo_manifest(root, duplicate_b=True)
+    original_manifest = manifest.read_bytes()
+    index = scan_yolo_dataset(root)
+    sample = next(item for item in index.samples if item.image_path.name == "b.jpg")
+    editor = YoloDatasetEditor(index)
+
+    editor.delete_sample(sample, 120, 120)
+
+    with manifest.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["source_image"] == "raw/a.jpg"
+    assert editor.undo_latest() is not None
+    assert manifest.read_bytes() == original_manifest
+
+
+def test_yolo_delete_and_undo_support_missing_label(
+    tmp_path: Path,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    manifest = write_yolo_manifest(root)
+    missing_label = root / "labels" / "val" / "b.txt"
+    missing_label.unlink()
+    original_manifest = manifest.read_bytes()
+    index = scan_yolo_dataset(root)
+    sample = next(item for item in index.samples if item.image_path.name == "b.jpg")
+    editor = YoloDatasetEditor(index)
+
+    editor.delete_sample(sample, 120, 120)
+    restored = editor.undo_latest()
+
+    assert restored is not None
+    assert sample.image_path.exists()
+    assert not sample.label_path.exists()
+    assert restored.annotations == ()
+    assert manifest.read_bytes() == original_manifest
+
+
+def test_yolo_save_does_not_rewrite_manifest(
+    tmp_path: Path,
+) -> None:
+    root = make_yolo_dataset(tmp_path / "yolo_f")
+    manifest = write_yolo_manifest(root)
+    original_manifest = manifest.read_bytes()
+    index = scan_yolo_dataset(root)
+    sample = next(item for item in index.samples if item.image_path.name == "a.jpg")
+    editor = YoloDatasetEditor(index)
+
+    editor.save_annotations(
+        sample,
+        (YoloAnnotation(2, BBox(20, 10, 180, 90)),),
+        200,
+        100,
+    )
+
+    assert manifest.read_bytes() == original_manifest
 
 
 def test_segmentation_rows_are_rejected_without_modification(

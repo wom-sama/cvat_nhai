@@ -843,9 +843,68 @@ class ClassificationDatasetEditor:
     def _manifest_keys_for_row(self, row: dict) -> Tuple[str, ...]:
         keys = []
         for field_name in MANIFEST_PATH_FIELDS:
-            key = self._manifest_value_key(row.get(field_name))
+            value = row.get(field_name)
+            key = self._manifest_value_key(value)
             if key is not None and key not in keys:
                 keys.append(key)
+            for rebased_key in self._rebased_manifest_keys(row, value):
+                if rebased_key not in keys:
+                    keys.append(rebased_key)
+        return tuple(keys)
+
+    def _rebased_manifest_keys(
+        self,
+        row: dict,
+        value: Optional[str],
+    ) -> Tuple[str, ...]:
+        """Index absolute manifest paths after a dataset is copied/moved."""
+        if not value:
+            return ()
+        split = str(row.get("split", "")).strip().lower()
+        if split not in SPLITS:
+            return ()
+        filename = Path(str(value)).name
+        if not filename:
+            return ()
+
+        class_names = []
+        try:
+            class_id = int(str(row.get("class_id", "")))
+        except (TypeError, ValueError):
+            class_id = -1
+        if 0 <= class_id < len(self.class_names):
+            class_names.append(self.class_names[class_id])
+        manifest_class = str(row.get("class_name", "")).strip()
+        if manifest_class and manifest_class not in class_names:
+            class_names.append(manifest_class)
+
+        keys = []
+        raw_parts = Path(str(value)).parts
+        for class_name in class_names:
+            for folder in _candidate_class_folders(
+                self.root,
+                split,
+                class_name,
+            ):
+                relative_parts: Tuple[str, ...] = ()
+                for index in range(len(raw_parts) - 1):
+                    if (
+                        raw_parts[index].casefold() == split.casefold()
+                        and raw_parts[index + 1].casefold()
+                        == folder.name.casefold()
+                    ):
+                        relative_parts = tuple(raw_parts[index + 2 :])
+                if not relative_parts:
+                    relative_parts = (filename,)
+                if any(
+                    part in {"", ".", ".."} for part in relative_parts
+                ):
+                    continue
+                key = self._manifest_path_key(
+                    folder.joinpath(*relative_parts)
+                )
+                if key not in keys:
+                    keys.append(key)
         return tuple(keys)
 
     def _rebuild_manifest_index(self) -> None:

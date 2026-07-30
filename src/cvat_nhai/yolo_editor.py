@@ -7,7 +7,7 @@ import tempfile
 import threading
 import uuid
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -47,6 +47,21 @@ class ExportCancelled(YoloEditorError):
 
 
 ProgressCallback = Optional[Callable[[dict], None]]
+
+YOLO_MANIFEST_FIELDS = (
+    "split",
+    "source_split",
+    "leakage_group",
+    "source_image",
+    "output_image",
+    "output_label",
+)
+
+
+@dataclass
+class _YoloManifestDelta:
+    removed: List[Tuple[int, dict]] = field(default_factory=list)
+    inserted: List[Tuple[int, dict]] = field(default_factory=list)
 
 
 def _check_export_cancelled(
@@ -316,6 +331,16 @@ class YoloDatasetEditor:
             self._path_key(sample.image_path): sample
             for sample in index.samples
         }
+        self._manifest_exists = self._manifest_path().exists()
+        (
+            self._manifest_fieldnames,
+            self._manifest_rows,
+        ) = self._read_manifest()
+        self._manifest_rows_by_image: Dict[str, List[dict]] = {}
+        self._rebuild_manifest_index()
+        self._manifest_signature = self._file_signature(
+            self._manifest_path()
+        )
 
     def _operation_dir(self, category: str, operation_id: str) -> Path:
         day = datetime.now().strftime("%Y-%m-%d")
@@ -394,14 +419,6 @@ class YoloDatasetEditor:
         image_width: int,
         image_height: int,
     ) -> None:
-        if not sample.image_path.exists():
-            raise YoloEditorError("Anh khong con ton tai")
-        old_annotations = read_yolo_annotations(
-            sample.label_path,
-            image_width,
-            image_height,
-            len(self.index.class_names),
-        )
         content = serialize_yolo_annotations(
             annotations,
             image_width,
@@ -412,7 +429,18 @@ class YoloDatasetEditor:
         backup_dir = self._operation_dir("edits", operation_id)
         backup_label = backup_dir / sample.label_path.name
         with self._lock:
+            if not sample.image_path.exists():
+                raise YoloEditorError("Anh khong con ton tai")
+            old_annotations = read_yolo_annotations(
+                sample.label_path,
+                image_width,
+                image_height,
+                len(self.index.class_names),
+            )
             label_existed = sample.label_path.exists()
+            original_label = self._read_optional_bytes(sample.label_path)
+            balance_path = self.index.root / "canbang.yaml"
+            original_balance = self._read_optional_bytes(balance_path)
             if label_existed:
                 shutil.copy2(sample.label_path, backup_label)
             else:
@@ -427,47 +455,40 @@ class YoloDatasetEditor:
                     annotations,
                     split=sample.split,
                 )
-            except Exception:
-                if label_existed:
-                    shutil.copy2(backup_label, sample.label_path)
-                else:
-                    try:
-                        sample.label_path.unlink()
-                    except FileNotFoundError:
-                        pass
                 self.journal.append(
                     {
                         "operation_id": operation_id,
-                        "status": "failed",
+                        "status": "committed",
                         "action": "edit_yolo",
                         "timestamp": datetime.now().isoformat(
                             timespec="seconds"
                         ),
                         "image": str(sample.image_path),
                         "label": str(sample.label_path),
+                        "backup_label": str(backup_label),
+                        "label_existed": label_existed,
+                        "saved_label_sha256": hashlib.sha256(
+                            content.encode("utf-8")
+                        ).hexdigest(),
+                        "split": sample.split,
+                        "image_width": image_width,
+                        "image_height": image_height,
+                        "old_objects": len(old_annotations),
+                        "new_objects": len(annotations),
                     }
                 )
+            except Exception:
+                self._write_optional_bytes(
+                    sample.label_path,
+                    original_label,
+                )
+                self._write_optional_bytes(balance_path, original_balance)
+                self._append_failed_record(
+                    operation_id,
+                    "edit_yolo",
+                    sample,
+                )
                 raise
-        self.journal.append(
-            {
-                "operation_id": operation_id,
-                "status": "committed",
-                "action": "edit_yolo",
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "image": str(sample.image_path),
-                "label": str(sample.label_path),
-                "backup_label": str(backup_label),
-                "label_existed": label_existed,
-                "saved_label_sha256": hashlib.sha256(
-                    content.encode("utf-8")
-                ).hexdigest(),
-                "split": sample.split,
-                "image_width": image_width,
-                "image_height": image_height,
-                "old_objects": len(old_annotations),
-                "new_objects": len(annotations),
-            }
-        )
 
     def delete_sample(
         self,
@@ -475,66 +496,87 @@ class YoloDatasetEditor:
         image_width: int,
         image_height: int,
     ) -> None:
-        if not sample.image_path.exists():
-            raise YoloEditorError("Anh khong con ton tai")
-        old_annotations = read_yolo_annotations(
-            sample.label_path,
-            image_width,
-            image_height,
-            len(self.index.class_names),
-        )
         operation_id = uuid.uuid4().hex
         archive_dir = self._operation_dir("deleted", operation_id)
         archived_image = archive_dir / sample.image_path.name
         archived_label = archive_dir / sample.label_path.name
         with self._lock:
-            shutil.move(str(sample.image_path), str(archived_image))
+            if not sample.image_path.exists():
+                raise YoloEditorError("Anh khong con ton tai")
+            self._assert_manifest_unchanged()
+            old_annotations = read_yolo_annotations(
+                sample.label_path,
+                image_width,
+                image_height,
+                len(self.index.class_names),
+            )
+            label_existed = sample.label_path.exists()
+            balance_path = self.index.root / "canbang.yaml"
+            original_balance = self._read_optional_bytes(balance_path)
+            manifest_path = self._manifest_path()
+            original_manifest = self._read_optional_bytes(manifest_path)
+            manifest_existed_before = self._manifest_exists
+            delta = _YoloManifestDelta()
             try:
-                if sample.label_path.exists():
+                shutil.move(str(sample.image_path), str(archived_image))
+                if label_existed:
                     shutil.move(str(sample.label_path), str(archived_label))
+                delta = self._remove_manifest_rows(sample.image_path)
+                self._write_manifest_state()
                 self._update_balance(
                     old_annotations,
                     (),
                     image_delta=-1,
                     split=sample.split,
                 )
-            except Exception:
-                sample.image_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(archived_image), str(sample.image_path))
-                if archived_label.exists():
-                    sample.label_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(archived_label), str(sample.label_path))
                 self.journal.append(
                     {
                         "operation_id": operation_id,
-                        "status": "failed",
+                        "status": "committed",
                         "action": "delete_yolo",
                         "timestamp": datetime.now().isoformat(
                             timespec="seconds"
                         ),
                         "image": str(sample.image_path),
                         "label": str(sample.label_path),
+                        "archived_image": str(archived_image),
+                        "archived_label": str(archived_label),
+                        "label_existed": label_existed,
+                        "split": sample.split,
+                        "image_width": image_width,
+                        "image_height": image_height,
+                        "objects": len(old_annotations),
+                        "manifest_existed_before": (
+                            manifest_existed_before
+                        ),
+                        "manifest_removed_rows": [
+                            {"index": index, "row": dict(row)}
+                            for index, row in delta.removed
+                        ],
                     }
                 )
+            except Exception:
+                if archived_image.exists() and not sample.image_path.exists():
+                    sample.image_path.parent.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+                    shutil.move(str(archived_image), str(sample.image_path))
+                if archived_label.exists():
+                    sample.label_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(archived_label), str(sample.label_path))
+                self._rollback_manifest_delta(delta)
+                self._restore_manifest_snapshot(
+                    original_manifest,
+                    manifest_existed_before,
+                )
+                self._write_optional_bytes(balance_path, original_balance)
+                self._append_failed_record(
+                    operation_id,
+                    "delete_yolo",
+                    sample,
+                )
                 raise
-        self.journal.append(
-            {
-                "operation_id": operation_id,
-                "status": "committed",
-                "action": "delete_yolo",
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "image": str(sample.image_path),
-                "label": str(sample.label_path),
-                "archived_image": str(archived_image),
-                "archived_label": str(archived_label),
-                "label_existed": sample.label_path.exists()
-                or archived_label.exists(),
-                "split": sample.split,
-                "image_width": image_width,
-                "image_height": image_height,
-                "objects": len(old_annotations),
-            }
-        )
 
     def undo_latest(self) -> Optional[YoloUndoResult]:
         with self._lock:
@@ -547,6 +589,7 @@ class YoloDatasetEditor:
             if action == "edit_yolo":
                 return self._undo_edit(record)
             if action == "delete_yolo":
+                self._assert_manifest_unchanged()
                 return self._undo_delete(record)
             return None
 
@@ -592,6 +635,8 @@ class YoloDatasetEditor:
             if label_existed
             else []
         )
+        balance_path = self.index.root / "canbang.yaml"
+        original_balance = self._read_optional_bytes(balance_path)
 
         self._write_optional_bytes(sample.label_path, previous_content)
         try:
@@ -603,14 +648,7 @@ class YoloDatasetEditor:
             self._append_undo_record(record, sample.image_path)
         except Exception:
             self._write_optional_bytes(sample.label_path, current_content)
-            try:
-                self._update_balance(
-                    previous_annotations,
-                    current_annotations,
-                    split=sample.split,
-                )
-            except Exception:
-                pass
+            self._write_optional_bytes(balance_path, original_balance)
             raise
         return YoloUndoResult(
             action="edit_yolo",
@@ -648,6 +686,12 @@ class YoloDatasetEditor:
             if label_existed
             else []
         )
+        balance_path = self.index.root / "canbang.yaml"
+        original_balance = self._read_optional_bytes(balance_path)
+        manifest_path = self._manifest_path()
+        original_manifest = self._read_optional_bytes(manifest_path)
+        manifest_existed_before_undo = self._manifest_exists
+        delta = _YoloManifestDelta()
 
         sample.image_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(archived_image), str(sample.image_path))
@@ -657,6 +701,11 @@ class YoloDatasetEditor:
                 sample.label_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(archived_label), str(sample.label_path))
                 label_moved = True
+            delta = self._restore_manifest_rows(record)
+            self._manifest_exists = bool(
+                record.get("manifest_existed_before", False)
+            )
+            self._write_manifest_state()
             self._update_balance(
                 (),
                 previous_annotations,
@@ -671,15 +720,12 @@ class YoloDatasetEditor:
             if sample.image_path.exists():
                 archived_image.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(sample.image_path), str(archived_image))
-            try:
-                self._update_balance(
-                    previous_annotations,
-                    (),
-                    image_delta=-1,
-                    split=sample.split,
-                )
-            except Exception:
-                pass
+            self._rollback_manifest_delta(delta)
+            self._restore_manifest_snapshot(
+                original_manifest,
+                manifest_existed_before_undo,
+            )
+            self._write_optional_bytes(balance_path, original_balance)
             raise
         return YoloUndoResult(
             action="delete_yolo",
@@ -712,6 +758,228 @@ class YoloDatasetEditor:
         return os.path.normcase(
             os.path.abspath(os.fspath(path.expanduser()))
         ).casefold()
+
+    def _manifest_path(self) -> Path:
+        return self.index.root / "manifest.csv"
+
+    def _read_manifest(self) -> Tuple[List[str], List[dict]]:
+        path = self._manifest_path()
+        if not path.exists():
+            return list(YOLO_MANIFEST_FIELDS), []
+        with path.open("r", newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = list(reader.fieldnames or YOLO_MANIFEST_FIELDS)
+            rows = [dict(row) for row in reader]
+        for field_name in YOLO_MANIFEST_FIELDS:
+            if field_name not in fieldnames:
+                fieldnames.append(field_name)
+        return fieldnames, rows
+
+    def _write_manifest_state(self) -> None:
+        path = self._manifest_path()
+        if not self._manifest_exists:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            self._manifest_signature = None
+            return
+        temporary = path.with_name(
+            ".{}.{}.tmp".format(path.name, uuid.uuid4().hex)
+        )
+        try:
+            with temporary.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=self._manifest_fieldnames,
+                )
+                writer.writeheader()
+                for row in self._manifest_rows:
+                    writer.writerow(
+                        {
+                            field_name: row.get(field_name, "")
+                            for field_name in self._manifest_fieldnames
+                        }
+                    )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except Exception:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        self._manifest_signature = self._file_signature(path)
+
+    def _file_signature(self, path: Path) -> Optional[Tuple[int, int]]:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_size, stat.st_mtime_ns
+
+    def _assert_manifest_unchanged(self) -> None:
+        if self._file_signature(self._manifest_path()) != (
+            self._manifest_signature
+        ):
+            raise YoloEditorError(
+                "manifest.csv da bi thay doi ben ngoai; hay mo lai dataset "
+                "YOLO de tranh ghi de du lieu"
+            )
+
+    def _manifest_value_key(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        raw = Path(str(value))
+        candidate = raw if raw.is_absolute() else self.index.root / raw
+        return self._path_key(candidate)
+
+    def _manifest_keys_for_row(self, row: dict) -> Tuple[str, ...]:
+        keys = []
+        value = row.get("output_image")
+        literal = self._manifest_value_key(value)
+        if literal is not None:
+            keys.append(literal)
+        rebased = self._rebased_manifest_image_key(row, value)
+        if rebased is not None and rebased not in keys:
+            keys.append(rebased)
+        return tuple(keys)
+
+    def _rebased_manifest_image_key(
+        self,
+        row: dict,
+        value: Optional[str],
+    ) -> Optional[str]:
+        """Resolve exported absolute paths after yolo_f is copied/moved."""
+        if not value:
+            return None
+        split = str(row.get("split", "")).strip().lower()
+        if split not in SPLITS:
+            return None
+        raw = Path(str(value))
+        parts = raw.parts
+        relative_parts: Tuple[str, ...] = ()
+        for index in range(len(parts) - 1):
+            if (
+                parts[index].casefold() == "images"
+                and parts[index + 1].casefold() == split.casefold()
+            ):
+                relative_parts = tuple(parts[index + 2 :])
+        if not relative_parts and raw.name:
+            relative_parts = (raw.name,)
+        if not relative_parts or any(
+            part in {"", ".", ".."} for part in relative_parts
+        ):
+            return None
+        candidate = self.index.root / "images" / split
+        candidate = candidate.joinpath(*relative_parts)
+        return self._path_key(candidate)
+
+    def _rebuild_manifest_index(self) -> None:
+        self._manifest_rows_by_image.clear()
+        for row in self._manifest_rows:
+            self._index_manifest_row(row)
+
+    def _index_manifest_row(self, row: dict) -> None:
+        for key in self._manifest_keys_for_row(row):
+            bucket = self._manifest_rows_by_image.setdefault(key, [])
+            if not any(existing is row for existing in bucket):
+                bucket.append(row)
+
+    def _deindex_manifest_row(self, row: dict) -> None:
+        for key in self._manifest_keys_for_row(row):
+            bucket = self._manifest_rows_by_image.get(key, [])
+            bucket[:] = [existing for existing in bucket if existing is not row]
+            if not bucket:
+                self._manifest_rows_by_image.pop(key, None)
+
+    def _remove_manifest_rows(self, image_path: Path) -> _YoloManifestDelta:
+        delta = _YoloManifestDelta()
+        if not self._manifest_exists:
+            return delta
+        matched = list(
+            self._manifest_rows_by_image.get(
+                self._path_key(image_path),
+                (),
+            )
+        )
+        matched_ids = {id(row) for row in matched}
+        for index, row in enumerate(self._manifest_rows):
+            if id(row) in matched_ids:
+                delta.removed.append((index, row))
+                self._deindex_manifest_row(row)
+        self._manifest_rows = [
+            row for row in self._manifest_rows if id(row) not in matched_ids
+        ]
+        return delta
+
+    def _restore_manifest_rows(self, record: dict) -> _YoloManifestDelta:
+        delta = _YoloManifestDelta()
+        entries = sorted(
+            record.get("manifest_removed_rows", []),
+            key=lambda entry: int(entry.get("index", 0)),
+        )
+        for entry in entries:
+            row = dict(entry.get("row") or {})
+            index = min(
+                max(0, int(entry.get("index", len(self._manifest_rows)))),
+                len(self._manifest_rows),
+            )
+            self._manifest_rows.insert(index, row)
+            self._index_manifest_row(row)
+            delta.inserted.append((index, row))
+        return delta
+
+    def _rollback_manifest_delta(self, delta: _YoloManifestDelta) -> None:
+        inserted_ids = {id(row) for _, row in delta.inserted}
+        for _, row in delta.inserted:
+            self._deindex_manifest_row(row)
+        if inserted_ids:
+            self._manifest_rows = [
+                row
+                for row in self._manifest_rows
+                if id(row) not in inserted_ids
+            ]
+        for index, row in sorted(delta.removed, key=lambda item: item[0]):
+            self._manifest_rows.insert(
+                min(max(0, index), len(self._manifest_rows)),
+                row,
+            )
+            self._index_manifest_row(row)
+
+    def _restore_manifest_snapshot(
+        self,
+        content: Optional[bytes],
+        existed: bool,
+    ) -> None:
+        self._manifest_exists = existed
+        self._write_optional_bytes(self._manifest_path(), content)
+        self._manifest_signature = self._file_signature(
+            self._manifest_path()
+        )
+
+    def _append_failed_record(
+        self,
+        operation_id: str,
+        action: str,
+        sample: YoloSample,
+    ) -> None:
+        try:
+            self.journal.append(
+                {
+                    "operation_id": operation_id,
+                    "status": "failed",
+                    "action": action,
+                    "timestamp": datetime.now().isoformat(
+                        timespec="seconds"
+                    ),
+                    "image": str(sample.image_path),
+                    "label": str(sample.label_path),
+                }
+            )
+        except Exception:
+            pass
 
     def _record_dimensions(
         self,
