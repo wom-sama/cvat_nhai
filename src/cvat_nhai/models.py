@@ -121,6 +121,13 @@ class YoloDatasetIndex:
 
 
 @dataclass(frozen=True)
+class YoloUndoResult:
+    action: str
+    sample: YoloSample
+    annotations: Tuple[YoloAnnotation, ...]
+
+
+@dataclass(frozen=True)
 class ClassificationSample:
     image_path: Path
     split: str
@@ -134,6 +141,13 @@ class ClassificationDatasetIndex:
     data_yaml: Optional[Path]
     class_names: Tuple[str, ...]
     samples: Tuple[ClassificationSample, ...]
+
+
+@dataclass(frozen=True)
+class ClassificationUndoResult:
+    action: str
+    sample: ClassificationSample
+    replaced_path: Optional[Path] = None
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,7 @@
 import json
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 
 class OperationJournal:
@@ -32,15 +32,22 @@ class OperationJournal:
                     continue
         return result
 
-    def latest_committed(self) -> Dict[str, Any]:
+    def latest_committed(
+        self,
+        actions: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        allowed_actions = set(actions or {"annotate", "delete"})
         undone = set()
         for record in reversed(self.records()):
-            if record.get("action") == "undo":
+            if (
+                record.get("action") == "undo"
+                and record.get("status") == "committed"
+            ):
                 undone.add(record.get("target_operation_id"))
             elif (
                 record.get("status") == "committed"
                 and record.get("operation_id") not in undone
-                and record.get("action") in {"annotate", "delete"}
+                and record.get("action") in allowed_actions
             ):
                 return record
         return {}

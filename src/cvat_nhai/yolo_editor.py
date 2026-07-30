@@ -26,6 +26,7 @@ from .models import (
     YoloAnnotation,
     YoloDatasetIndex,
     YoloSample,
+    YoloUndoResult,
 )
 from .utils import (
     atomic_write_json,
@@ -311,6 +312,10 @@ class YoloDatasetEditor:
         self.archive_root.mkdir(parents=True, exist_ok=True)
         self.journal = OperationJournal(self.archive_root / "operations.jsonl")
         self._lock = threading.Lock()
+        self._samples_by_image = {
+            self._path_key(sample.image_path): sample
+            for sample in index.samples
+        }
 
     def _operation_dir(self, category: str, operation_id: str) -> Path:
         day = datetime.now().strftime("%Y-%m-%d")
@@ -323,6 +328,7 @@ class YoloDatasetEditor:
         old_annotations: Sequence[YoloAnnotation],
         new_annotations: Sequence[YoloAnnotation],
         image_delta: int = 0,
+        split: Optional[str] = None,
     ) -> None:
         path = self.index.root / "canbang.yaml"
         if not path.exists():
@@ -357,6 +363,28 @@ class YoloDatasetEditor:
             ratio = count / total_objects if total_objects else 0.0
             entry["ratio"] = round(ratio, 6)
             entry["percent"] = round(ratio * 100.0, 2)
+        split_blocks = block.get("splits")
+        if split in SPLITS and isinstance(split_blocks, dict):
+            split_block = split_blocks.get(split)
+            if isinstance(split_block, dict):
+                split_classes = split_block.get("classes")
+                if isinstance(split_classes, dict):
+                    for class_id in range(len(self.index.class_names)):
+                        key = str(class_id)
+                        split_classes[key] = max(
+                            0,
+                            int(split_classes.get(key, 0))
+                            - old_counts[class_id]
+                            + new_counts[class_id],
+                        )
+                    split_block["total_images"] = max(
+                        0,
+                        int(split_block.get("total_images", 0))
+                        + image_delta,
+                    )
+                    split_block["total_objects"] = sum(
+                        int(value) for value in split_classes.values()
+                    )
         atomic_write_yaml(path, payload)
 
     def save_annotations(
@@ -394,7 +422,11 @@ class YoloDatasetEditor:
                 )
             try:
                 atomic_write_text(sample.label_path, content)
-                self._update_balance(old_annotations, annotations)
+                self._update_balance(
+                    old_annotations,
+                    annotations,
+                    split=sample.split,
+                )
             except Exception:
                 if label_existed:
                     shutil.copy2(backup_label, sample.label_path)
@@ -425,6 +457,13 @@ class YoloDatasetEditor:
                 "image": str(sample.image_path),
                 "label": str(sample.label_path),
                 "backup_label": str(backup_label),
+                "label_existed": label_existed,
+                "saved_label_sha256": hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest(),
+                "split": sample.split,
+                "image_width": image_width,
+                "image_height": image_height,
                 "old_objects": len(old_annotations),
                 "new_objects": len(annotations),
             }
@@ -453,7 +492,12 @@ class YoloDatasetEditor:
             try:
                 if sample.label_path.exists():
                     shutil.move(str(sample.label_path), str(archived_label))
-                self._update_balance(old_annotations, (), image_delta=-1)
+                self._update_balance(
+                    old_annotations,
+                    (),
+                    image_delta=-1,
+                    split=sample.split,
+                )
             except Exception:
                 sample.image_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(archived_image), str(sample.image_path))
@@ -483,7 +527,247 @@ class YoloDatasetEditor:
                 "label": str(sample.label_path),
                 "archived_image": str(archived_image),
                 "archived_label": str(archived_label),
+                "label_existed": sample.label_path.exists()
+                or archived_label.exists(),
+                "split": sample.split,
+                "image_width": image_width,
+                "image_height": image_height,
                 "objects": len(old_annotations),
+            }
+        )
+
+    def undo_latest(self) -> Optional[YoloUndoResult]:
+        with self._lock:
+            record = self.journal.latest_committed(
+                {"edit_yolo", "delete_yolo"}
+            )
+            if not record:
+                return None
+            action = str(record.get("action", ""))
+            if action == "edit_yolo":
+                return self._undo_edit(record)
+            if action == "delete_yolo":
+                return self._undo_delete(record)
+            return None
+
+    def _undo_edit(self, record: dict) -> YoloUndoResult:
+        sample = self._sample_from_record(record)
+        if not sample.image_path.exists():
+            raise YoloEditorError(
+                "Khong the hoan tac: anh YOLO khong con ton tai"
+            )
+        width, height = self._record_dimensions(record, sample.image_path)
+        expected_digest = str(record.get("saved_label_sha256", ""))
+        current_content = self._read_optional_bytes(sample.label_path)
+        if expected_digest:
+            current_digest = hashlib.sha256(
+                current_content or b""
+            ).hexdigest()
+            if current_digest != expected_digest:
+                raise YoloEditorError(
+                    "Khong the hoan tac: label da bi thay doi ben ngoai"
+                )
+        current_annotations = read_yolo_annotations(
+            sample.label_path,
+            width,
+            height,
+            len(self.index.class_names),
+        )
+        backup_label = Path(str(record.get("backup_label", "")))
+        label_existed = bool(record.get("label_existed", backup_label.exists()))
+        if label_existed and not backup_label.exists():
+            raise YoloEditorError(
+                "Khong the hoan tac: label backup khong con ton tai"
+            )
+        previous_content = (
+            backup_label.read_bytes() if label_existed else None
+        )
+        previous_annotations = (
+            read_yolo_annotations(
+                backup_label,
+                width,
+                height,
+                len(self.index.class_names),
+            )
+            if label_existed
+            else []
+        )
+
+        self._write_optional_bytes(sample.label_path, previous_content)
+        try:
+            self._update_balance(
+                current_annotations,
+                previous_annotations,
+                split=sample.split,
+            )
+            self._append_undo_record(record, sample.image_path)
+        except Exception:
+            self._write_optional_bytes(sample.label_path, current_content)
+            try:
+                self._update_balance(
+                    previous_annotations,
+                    current_annotations,
+                    split=sample.split,
+                )
+            except Exception:
+                pass
+            raise
+        return YoloUndoResult(
+            action="edit_yolo",
+            sample=sample,
+            annotations=tuple(previous_annotations),
+        )
+
+    def _undo_delete(self, record: dict) -> YoloUndoResult:
+        sample = self._sample_from_record(record)
+        archived_image = Path(str(record.get("archived_image", "")))
+        archived_label = Path(str(record.get("archived_label", "")))
+        if not archived_image.exists():
+            raise YoloEditorError(
+                "Khong the hoan tac: anh archive khong con ton tai"
+            )
+        if sample.image_path.exists() or sample.label_path.exists():
+            raise YoloEditorError(
+                "Khong the hoan tac vi file dich YOLO da ton tai"
+            )
+        width, height = self._record_dimensions(record, archived_image)
+        label_existed = bool(
+            record.get("label_existed", archived_label.exists())
+        )
+        if label_existed and not archived_label.exists():
+            raise YoloEditorError(
+                "Khong the hoan tac: label archive khong con ton tai"
+            )
+        previous_annotations = (
+            read_yolo_annotations(
+                archived_label,
+                width,
+                height,
+                len(self.index.class_names),
+            )
+            if label_existed
+            else []
+        )
+
+        sample.image_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(archived_image), str(sample.image_path))
+        label_moved = False
+        try:
+            if label_existed:
+                sample.label_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(archived_label), str(sample.label_path))
+                label_moved = True
+            self._update_balance(
+                (),
+                previous_annotations,
+                image_delta=1,
+                split=sample.split,
+            )
+            self._append_undo_record(record, sample.image_path)
+        except Exception:
+            if label_moved and sample.label_path.exists():
+                archived_label.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(sample.label_path), str(archived_label))
+            if sample.image_path.exists():
+                archived_image.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(sample.image_path), str(archived_image))
+            try:
+                self._update_balance(
+                    previous_annotations,
+                    (),
+                    image_delta=-1,
+                    split=sample.split,
+                )
+            except Exception:
+                pass
+            raise
+        return YoloUndoResult(
+            action="delete_yolo",
+            sample=sample,
+            annotations=tuple(previous_annotations),
+        )
+
+    def _sample_from_record(self, record: dict) -> YoloSample:
+        image_path = Path(str(record.get("image", ""))).resolve(
+            strict=False
+        )
+        sample = self._samples_by_image.get(self._path_key(image_path))
+        if sample is not None:
+            return sample
+        label_path = Path(str(record.get("label", ""))).resolve(
+            strict=False
+        )
+        split = str(record.get("split", ""))
+        if split not in SPLITS:
+            raise YoloEditorError(
+                "Khong the hoan tac: khong xac dinh duoc split"
+            )
+        return YoloSample(
+            image_path=image_path,
+            label_path=label_path,
+            split=split,
+        )
+
+    def _path_key(self, path: Path) -> str:
+        return os.path.normcase(
+            os.path.abspath(os.fspath(path.expanduser()))
+        ).casefold()
+
+    def _record_dimensions(
+        self,
+        record: dict,
+        image_path: Path,
+    ) -> Tuple[int, int]:
+        width = int(record.get("image_width", 0) or 0)
+        height = int(record.get("image_height", 0) or 0)
+        if width > 0 and height > 0:
+            return width, height
+        with Image.open(image_path) as image:
+            return image.size
+
+    def _read_optional_bytes(self, path: Path) -> Optional[bytes]:
+        return path.read_bytes() if path.exists() else None
+
+    def _write_optional_bytes(
+        self,
+        path: Path,
+        content: Optional[bytes],
+    ) -> None:
+        if content is None:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="." + path.name + ".",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, path)
+        except Exception:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _append_undo_record(self, record: dict, image_path: Path) -> None:
+        self.journal.append(
+            {
+                "operation_id": uuid.uuid4().hex,
+                "status": "committed",
+                "action": "undo",
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "target_operation_id": record.get("operation_id"),
+                "target_action": record.get("action"),
+                "image": str(image_path),
             }
         )
 

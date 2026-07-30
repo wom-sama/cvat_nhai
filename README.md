@@ -79,6 +79,8 @@ hien thi tat ca bbox/class da co.
 - `F` bo moi thay doi chua luu va tai lai snapshot nhan da co.
 - `Delete` chuyen ca anh va label vao
   `<dataset>\.cvat_nhai_editor_archive`.
+- `Ctrl+Z` bo thay doi chua `Enter`; neu anh da duoc ghi hoac xoa thi khoi
+  phuc label/anh va `canbang.yaml` tu transaction gan nhat.
 - `A` / `D` chi chuyen anh khi thay doi hien tai da duoc `Enter` hoac `F`,
   tranh mat nhan dang sua.
 - Thanh tien do co the click hoac keo nhanh toi bat ky anh nao. Trong luc
@@ -122,10 +124,10 @@ Khi export, ung dung hien dialog gom 4 giai doan, ten anh dang xu ly va thanh
 tien do. Nut `Huy an toan` dung tai diem an toan va xoa thu muc tam; dataset
 nguon khong bi thay doi va khong de lai bo export dang do.
 
-Khi nhan `Enter`, `DEL`, hoan tac hoac migration, cua so chinh luon duoc giu
-hien thi va co overlay `Dang xu ly` voi progress bar. Khi anh ke tiep dang
-preload, canvas giu anh hien tai kem thong bao tai thay vi chuyen sang man hinh
-trong.
+Khi nhan `Enter`, `DEL` hoac hoan tac, tac vu chay ngoai UI thread. Thao tac
+nhanh khong lam chop overlay; neu vuot 180 ms, overlay `Dang xu ly` tu hien de
+nguoi dung biet app van dang lam viec. Khi anh ke tiep dang preload, canvas giu
+anh hien tai kem thong bao tai thay vi chuyen sang man hinh trong.
 
 Truoc khi chon thu muc xuat, dialog `Cau hinh class_f` cho phep chinh margin
 tu `0%` den `50%` moi canh bbox. Bon crop ngau nhien duoc cap nhat truc tiep
@@ -164,6 +166,16 @@ thay vi ghi de.
 vao `class_f\.cvat_nhai_classification_archive` va xoa dong tu manifest neu
 co. Khi class chua luu, app chan chuyen anh, keo thanh tien do va doi bo loc de
 tranh lam roi anh vao class sai do thao tac nhanh.
+
+`Ctrl+Z` bo lua chon class chua luu. Sau `Enter` hoac `Delete`, phim nay phuc
+hoi dung duong dan anh, class, dong `manifest.csv`, `canbang.yaml` va
+`stats.json`. Undo tu choi ghi de neu file dich hoac manifest da bi sua ben
+ngoai ung dung.
+
+Sau khi mo dataset, tool giu chi muc manifest va bo dem split/class trong bo
+nho. Moi thay doi chi cap nhat cac class lien quan, khong quet lai toan bo cay
+`class_f`; manifest va metadata van duoc ghi atomic, co rollback neu mot buoc
+that bai.
 
 Che do nay dung chung bo loc split va class voi YOLO editor. Bo loc class_f dua
 tren class thu muc hien tai cua anh crop; sau khi `Enter` hoac `Delete`, danh
