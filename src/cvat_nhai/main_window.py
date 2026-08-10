@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 
 from PIL import Image, ImageOps
 from PySide6.QtCore import QEvent, QSettings, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QImage, QImageReader, QKeySequence
+from PySide6.QtGui import QAction, QColor, QImage, QImageReader, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -60,6 +60,10 @@ from .scanner import scan_images
 from .schema import audit_schema, initialize_empty_datasets
 from .seek_slider import SeekSlider
 from .settings_dialog import SettingsDialog
+from .simple_classification_editor import (
+    SimpleClassificationEditor,
+    scan_simple_classification_dataset,
+)
 from .workers import FunctionTask
 from .yolo_editor import (
     YoloDatasetEditor,
@@ -85,6 +89,7 @@ class MainWindow(QMainWindow):
     request_focus_canvas = Signal()
     NAVIGATION_INITIAL_DELAY_MS = 260
     NAVIGATION_REPEAT_MS = 140
+    CLASSIFICATION_MODES = ("class_edit", "simple_class")
 
     def __init__(self) -> None:
         super().__init__()
@@ -131,6 +136,12 @@ class MainWindow(QMainWindow):
         self.source_root = Path(
             self.settings.value("source/root", "")
         ) if self.settings.value("source/root", "") else None
+        simple_root_value = str(
+            self.settings.value("simple_classification/root", "")
+        ).strip()
+        self.simple_classification_root = (
+            Path(simple_root_value) if simple_root_value else None
+        )
 
         self.manager = self._make_manager()
         self.mode = "label"
@@ -206,7 +217,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel(APP_NAME)
         title.setObjectName("appTitle")
-        subtitle = QLabel("Gan nhan nhanh - 5 lop xoai")
+        subtitle = QLabel("Gan nhan va kiem tra dataset anh")
         subtitle.setObjectName("muted")
         side.addWidget(title)
         side.addWidget(subtitle)
@@ -218,6 +229,10 @@ class MainWindow(QMainWindow):
         self.mode_combo.addItem("Gan nhan anh moi", "label")
         self.mode_combo.addItem("Xem / sua dataset YOLO cu", "edit")
         self.mode_combo.addItem("Kiem tra / sua class_f", "class_edit")
+        self.mode_combo.addItem(
+            "Data phan loai don gian (thu muc class)",
+            "simple_class",
+        )
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         side.addWidget(self.mode_combo)
 
@@ -228,12 +243,12 @@ class MainWindow(QMainWindow):
         self.source_edit = QLineEdit()
         self.source_edit.setPlaceholderText("Chon thu muc anh can gan lai nhan")
         self.source_edit.returnPressed.connect(self.scan_source)
-        browse = QToolButton()
-        browse.setText("...")
-        browse.setToolTip("Chon thu muc (Ctrl+O)")
-        browse.clicked.connect(self.choose_source)
+        self.source_browse = QToolButton()
+        self.source_browse.setText("...")
+        self.source_browse.setToolTip("Chon thu muc (Ctrl+O)")
+        self.source_browse.clicked.connect(self.choose_source)
         source_row.addWidget(self.source_edit)
-        source_row.addWidget(browse)
+        source_row.addWidget(self.source_browse)
         side.addLayout(source_row)
 
         self.scan_button = QPushButton("Quet anh")
@@ -285,6 +300,7 @@ class MainWindow(QMainWindow):
 
         self.editor_split_status = QLabel("Split hien tai: -")
         self.editor_split_status.setObjectName("muted")
+        self.editor_split_status.setWordWrap(True)
         self.editor_split_status.setToolTip(
             "Split goc cua anh dang xem trong dataset YOLO."
         )
@@ -336,24 +352,15 @@ class MainWindow(QMainWindow):
         self.export_button.setVisible(False)
         side.addWidget(self.export_button)
 
-        class_label = QLabel("CHON CLASS (PHIM 1-5)")
-        class_label.setObjectName("sectionLabel")
-        side.addWidget(class_label)
-        for index, (raw_name, label, color) in enumerate(
-            zip(CLASS_NAMES, CLASS_LABELS, CLASS_COLORS)
-        ):
-            button = QPushButton()
-            button.setCheckable(True)
-            button.setProperty("classButton", True)
-            button.setProperty("classColor", color)
-            button.setMinimumHeight(58)
-            button.setText("{}   {}\n     {}".format(index + 1, label, raw_name))
-            button.setToolTip("Phim {}".format(index + 1))
-            button.clicked.connect(
-                lambda checked=False, value=index: self.select_class(value)
-            )
-            self.class_buttons.append(button)
-            side.addWidget(button)
+        self.class_label = QLabel("CHON CLASS (PHIM 1-5)")
+        self.class_label.setObjectName("sectionLabel")
+        side.addWidget(self.class_label)
+        self.class_button_container = QWidget()
+        self.class_button_layout = QVBoxLayout(self.class_button_container)
+        self.class_button_layout.setContentsMargins(0, 0, 0, 0)
+        self.class_button_layout.setSpacing(12)
+        side.addWidget(self.class_button_container)
+        self._ensure_class_button_count(len(CLASS_NAMES))
 
         split_row = QHBoxLayout()
         self.split_label = QLabel("Split:")
@@ -368,6 +375,7 @@ class MainWindow(QMainWindow):
 
         self.bbox_label = QLabel("BBox: chua ve")
         self.bbox_label.setObjectName("muted")
+        self.bbox_label.setWordWrap(True)
         side.addWidget(self.bbox_label)
 
         side.addSpacerItem(
@@ -441,7 +449,7 @@ class MainWindow(QMainWindow):
         content_layout.addLayout(top)
 
         self.canvas = AnnotationCanvas()
-        self.canvas.set_class_catalog(CLASS_NAMES, CLASS_COLORS)
+        self._configure_class_buttons(CLASS_NAMES)
         self.canvas.bbox_changed.connect(self._bbox_changed)
         self.canvas.active_annotation_changed.connect(
             self._active_annotation_changed
@@ -595,6 +603,8 @@ class MainWindow(QMainWindow):
             title = "Chon dataset YOLO co data.yaml"
         elif self.mode == "class_edit":
             title = "Chon thu muc class_f"
+        elif self.mode == "simple_class":
+            title = "Chon thu muc data co cac thu muc class con"
         else:
             title = "Chon thu muc anh nguon"
         folder = QFileDialog.getExistingDirectory(
@@ -611,6 +621,7 @@ class MainWindow(QMainWindow):
         if mode == self.mode:
             return
         self.mode = mode
+        self._stop_continuous_navigation()
         self.images = []
         self.current_index = 0
         self.current_path = None
@@ -629,46 +640,53 @@ class MainWindow(QMainWindow):
         self.classification_original_class_id = -1
         self.image_cache.clear()
         self.canvas.clear_image()
-        self.canvas.set_annotation_enabled(mode != "class_edit")
+        self.canvas.set_annotation_enabled(
+            mode not in self.CLASSIFICATION_MODES
+        )
         self.file_label.setText("Chua co anh")
         self.path_label.clear()
         self.queue_label.setText("0 anh")
         self.position_label.setText("0 / 0")
         self.progress.setValue(0)
-        self.source_edit.clear()
 
         editing = mode == "edit"
-        classification_editing = mode == "class_edit"
+        class_f_editing = mode == "class_edit"
+        simple_editing = mode == "simple_class"
+        classification_editing = mode in self.CLASSIFICATION_MODES
         filterable = editing or classification_editing
-        self.source_label.setText(
-            (
-                "DATASET YOLO CU"
-                if editing
-                else (
-                    "DATASET CLASS_F"
-                    if classification_editing
-                    else "THU MUC NGUON"
-                )
+        split_filterable = editing or class_f_editing
+
+        if editing:
+            self.source_label.setText("DATASET YOLO CU")
+            self.source_edit.setPlaceholderText("Chon thu muc chua data.yaml")
+            self.scan_button.setText("Mo dataset YOLO")
+            self.source_edit.clear()
+        elif class_f_editing:
+            self.source_label.setText("DATASET CLASS_F")
+            self.source_edit.setPlaceholderText(
+                "Chon thu muc class_f co train/val/test"
             )
-        )
-        self.source_edit.setPlaceholderText(
-            (
-                "Chon thu muc chua data.yaml"
-                if editing
-                else (
-                    "Chon thu muc class_f co train/val/test"
-                    if classification_editing
-                    else "Chon thu muc anh can gan lai nhan"
-                )
+            self.scan_button.setText("Mo class_f")
+            self.source_edit.clear()
+        elif simple_editing:
+            self.source_label.setText("DATA PHAN LOAI DON GIAN")
+            self.source_edit.setPlaceholderText(
+                "Chon thu muc data; moi thu muc con la mot class"
             )
-        )
-        self.scan_button.setText(
-            (
-                "Mo dataset YOLO"
-                if editing
-                else ("Mo class_f" if classification_editing else "Quet anh")
+            self.scan_button.setText("Mo data don gian")
+            self.source_edit.setText(
+                str(self.simple_classification_root)
+                if self.simple_classification_root is not None
+                else ""
             )
-        )
+        else:
+            self.source_label.setText("THU MUC NGUON")
+            self.source_edit.setPlaceholderText(
+                "Chon thu muc anh can gan lai nhan"
+            )
+            self.scan_button.setText("Quet anh")
+            self.source_edit.clear()
+
         self.destination_label.setVisible(not filterable)
         self.destination_edit.setVisible(not filterable)
         self.destination_browse.setVisible(not filterable)
@@ -676,8 +694,8 @@ class MainWindow(QMainWindow):
         self.split_label.setVisible(not filterable)
         self.split_combo.setVisible(not filterable)
         self.editor_split_status.setVisible(filterable)
-        self.editor_split_filter_label.setVisible(filterable)
-        self.editor_split_filter_combo.setVisible(filterable)
+        self.editor_split_filter_label.setVisible(split_filterable)
+        self.editor_split_filter_combo.setVisible(split_filterable)
         self.editor_class_filter_label.setVisible(filterable)
         self.editor_class_filter_combo.setVisible(filterable)
         self.undo_button.setVisible(True)
@@ -686,94 +704,147 @@ class MainWindow(QMainWindow):
         self.next_box_action.setEnabled(editing)
         self.previous_box_action.setEnabled(editing)
         self.progress.setEnabled(filterable)
-        self.commit_button.setText(
-            (
-                "ENTER  Ap dung thay doi"
-                if editing
-                else (
-                    "ENTER  Ap dung class"
-                    if classification_editing
-                    else "ENTER  Luu va chuyen anh"
-                )
-            )
-        )
-        self.reset_button.setText(
-            (
-                "F  Ve nhan goc"
-                if editing
-                else (
-                    "F  Ve class goc"
-                    if classification_editing
-                    else "F  Lam lai"
-                )
-            )
-        )
-        self.delete_button.setText(
-            (
-                "DEL  Xoa anh + nhan"
-                if editing
-                else (
-                    "DEL  Xoa anh khoi class_f"
-                    if classification_editing
-                    else "DEL  Loai bo"
-                )
-            )
-        )
-        self.help_text.setText(
-            (
+        if editing:
+            self.commit_button.setText("ENTER  Ap dung thay doi")
+            self.reset_button.setText("F  Ve nhan goc")
+            self.delete_button.setText("DEL  Xoa anh + nhan")
+            self.help_text.setText(
                 "Click box: chon object   |   Keo/resize: sua box   |   "
                 "Tab/Shift+Tab: doi box   |   Keo vung trong: them box   |   "
                 "Backspace: xoa box   |   Ctrl+Z: hoan tac   |   "
                 "Giu A/D: anh truoc/sau"
-                if editing
-                else (
-                    "Phim 1-5: doi class   |   ENTER: ap dung   |   "
-                    "F: ve class goc   |   DEL: xoa anh   |   "
-                    "Ctrl+Z: hoan tac   |   Wheel: zoom   |   "
-                    "Space+drag: pan   |   Giu A/D: anh truoc/sau"
-                    if classification_editing
-                    else "Keo chuot: tao bbox   |   Keo trong khung: di chuyen   |   "
-                    "Keo diem vuong: resize   |   Wheel: zoom   |   Space+drag: pan   |   Giu A/D: anh truoc/sau"
-                )
             )
+        elif classification_editing:
+            self.commit_button.setText("ENTER  Ap dung class")
+            self.reset_button.setText("F  Ve class goc")
+            self.delete_button.setText(
+                "DEL  Loai bo khoi data"
+                if simple_editing
+                else "DEL  Xoa anh khoi class_f"
+            )
+            self.help_text.setText(
+                "Phim 1-9/click: doi class   |   ENTER: ap dung   |   "
+                "F: ve class goc   |   DEL: loai anh   |   "
+                "Ctrl+Z: hoan tac   |   Wheel: zoom   |   "
+                "Space+drag: pan   |   Giu A/D: anh truoc/sau"
+            )
+        else:
+            self.commit_button.setText("ENTER  Luu va chuyen anh")
+            self.reset_button.setText("F  Lam lai")
+            self.delete_button.setText("DEL  Loai bo")
+            self.help_text.setText(
+                "Keo chuot: tao bbox   |   Keo trong khung: di chuyen   |   "
+                "Keo diem vuong: resize   |   Wheel: zoom   |   "
+                "Space+drag: pan   |   Giu A/D: anh truoc/sau"
+            )
+        self.class_label.setText(
+            "CHON CLASS (PHIM 1-9 HOAC CLICK)"
+            if simple_editing
+            else "CHON CLASS (PHIM 1-5)"
         )
-        self._configure_class_buttons(CLASS_NAMES)
+        self._configure_class_buttons(() if simple_editing else CLASS_NAMES)
         self._update_schema_status()
 
-    def _configure_class_buttons(self, names) -> None:
-        if len(names) > len(self.class_buttons):
-            raise YoloEditorError(
-                "UI hien tai ho tro toi da {} class".format(
-                    len(self.class_buttons)
-                )
+    def _class_color(self, class_id: int) -> str:
+        if 0 <= class_id < len(CLASS_COLORS):
+            return CLASS_COLORS[class_id]
+        hue = (class_id * 137 + 17) % 360
+        return QColor.fromHsv(hue, 185, 235).name()
+
+    def _ensure_class_button_count(self, count: int) -> None:
+        while len(self.class_buttons) < count:
+            index = len(self.class_buttons)
+            button = QPushButton()
+            button.setCheckable(True)
+            button.setProperty("classButton", True)
+            button.setMinimumHeight(58)
+            button.clicked.connect(
+                lambda checked=False, value=index: self.select_class(value)
             )
-        self.active_class_names = tuple(str(name) for name in names)
+            self.class_buttons.append(button)
+            self.class_button_layout.addWidget(button)
+
+    def _simple_class_counts(self):
+        if self.mode != "simple_class" or self.classification_manager is None:
+            return ()
+        counts = getattr(self.classification_manager, "class_counts", ())
+        return tuple(int(value) for value in counts)
+
+    def _update_class_button_texts(self) -> None:
+        counts = self._simple_class_counts()
+        canonical = self.active_class_names == CLASS_NAMES
         for index, button in enumerate(self.class_buttons):
             visible = index < len(self.active_class_names)
             button.setVisible(visible)
-            button.setChecked(False)
-            if visible:
-                name = self.active_class_names[index]
-                label = (
-                    CLASS_LABELS[index]
-                    if tuple(names) == CLASS_NAMES
-                    else name
-                )
+            if not visible:
+                button.setChecked(False)
+                continue
+            name = self.active_class_names[index]
+            color = self._class_color(index)
+            button.setProperty("classColor", color)
+            if self.mode == "simple_class":
+                count = counts[index] if index < len(counts) else 0
                 button.setText(
-                    "{}   {}\n     {}".format(index + 1, label, name)
+                    "{}   {}\n     {} anh".format(index + 1, name, count)
                 )
+            elif canonical:
+                button.setText(
+                    "{}   {}\n     {}".format(
+                        index + 1,
+                        CLASS_LABELS[index],
+                        name,
+                    )
+                )
+            else:
+                button.setText("{}   {}".format(index + 1, name))
+            button.setToolTip(
+                "Phim {}\nClass: {}".format(index + 1, name)
+                if index < 9
+                else "Click de chon class\nClass: {}".format(name)
+            )
+
+    def _configure_class_buttons(self, names) -> None:
+        class_names = tuple(str(name) for name in names)
+        if self.mode != "simple_class" and len(class_names) > len(CLASS_NAMES):
+            raise YoloEditorError(
+                "UI sua YOLO/class_f ho tro toi da {} class".format(
+                    len(CLASS_NAMES)
+                )
+            )
+        self._ensure_class_button_count(len(class_names))
+        self.active_class_names = class_names
+        for button in self.class_buttons:
+            button.setChecked(False)
+        self._update_class_button_texts()
         self.canvas.set_class_catalog(
             self.active_class_names,
-            CLASS_COLORS[: len(self.active_class_names)],
+            tuple(
+                self._class_color(index)
+                for index in range(len(self.active_class_names))
+            ),
         )
         self.selected_class = -1
 
+    def _refresh_simple_class_counts(self) -> None:
+        if self.mode != "simple_class":
+            return
+        self._update_class_button_texts()
+        self._configure_editor_class_filter(self.active_class_names)
+
     def _configure_editor_class_filter(self, names) -> None:
         current = self.editor_class_filter
+        counts = self._simple_class_counts()
         combo = self.editor_class_filter_combo
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem("Tat ca class", "all")
+        combo.addItem(
+            (
+                "Tat ca class ({} anh)".format(sum(counts))
+                if counts
+                else "Tat ca class"
+            ),
+            "all",
+        )
         for index, name in enumerate(names):
             label = (
                 CLASS_LABELS[index]
@@ -781,7 +852,15 @@ class MainWindow(QMainWindow):
                 else str(name)
             )
             combo.addItem(
-                "{}  {}".format(index + 1, label),
+                (
+                    "{}  {} ({} anh)".format(
+                        index + 1,
+                        label,
+                        counts[index],
+                    )
+                    if index < len(counts)
+                    else "{}  {}".format(index + 1, label)
+                ),
                 index,
             )
         selected_index = combo.findData(current)
@@ -871,6 +950,8 @@ class MainWindow(QMainWindow):
             self.scan_source()
 
     def scan_source(self) -> None:
+        if self.busy:
+            return
         text = self.source_edit.text().strip()
         if not text:
             return
@@ -884,11 +965,17 @@ class MainWindow(QMainWindow):
         if self.mode == "class_edit":
             self._scan_classification_dataset(root)
             return
+        if self.mode == "simple_class":
+            self._scan_simple_classification_dataset(root)
+            return
         self.source_root = root.resolve()
         self.settings.setValue("source/root", str(self.source_root))
-        self.scan_button.setEnabled(False)
         self.scan_button.setText("Dang quet...")
-        self.statusBar().showMessage("Dang quet thu muc va cac thu muc con...")
+        self._set_busy(
+            True,
+            "Dang quet thu muc va cac thu muc con...",
+            delayed_overlay=True,
+        )
         task = FunctionTask(
             scan_images,
             self.source_root,
@@ -902,35 +989,104 @@ class MainWindow(QMainWindow):
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(
             lambda: (
-                self.scan_button.setEnabled(True),
+                self._set_busy(False),
                 self.scan_button.setText("Quet anh"),
             )
         )
         self._start_task(task)
 
-    def _scan_classification_dataset(self, root: Path) -> None:
-        self.scan_button.setEnabled(False)
-        self.scan_button.setText("Dang mo class_f...")
+    def _scan_simple_classification_dataset(self, root: Path) -> None:
+        self.scan_button.setText("Dang mo data...")
+        self._set_busy(
+            True,
+            "Dang doc cac thu muc class va dem anh...",
+            delayed_overlay=True,
+        )
+        task = FunctionTask(scan_simple_classification_dataset, root)
+        task.signals.succeeded.connect(
+            self._simple_classification_scan_finished
+        )
+        task.signals.failed.connect(self._background_failed)
+        task.signals.finished.connect(
+            lambda: (
+                self._set_busy(False),
+                self.scan_button.setText("Mo data don gian"),
+            )
+        )
+        self._start_task(task)
+
+    def _simple_classification_scan_finished(self, result: object) -> None:
+        try:
+            manager = SimpleClassificationEditor(result)
+        except Exception as error:
+            self._show_error(str(error))
+            return
+        self.classification_index = result
+        self.classification_manager = manager
+        self.classification_samples_by_path = {
+            sample.image_path: sample for sample in result.samples
+        }
+        self.classification_all_images = [
+            sample.image_path for sample in result.samples
+        ]
+        self._set_editor_split_filter_ui("all")
+        self._set_editor_class_filter_ui("all")
+        self._configure_class_buttons(result.class_names)
+        self._configure_editor_class_filter(result.class_names)
+        self.images = list(self.classification_all_images)
+        self.current_index = 0
+        self.image_cache.clear()
+        self.simple_classification_root = result.root
+        self.settings.setValue(
+            "simple_classification/root",
+            str(result.root),
+        )
+        self.source_edit.setCursorPosition(0)
+        self.source_edit.setToolTip(str(result.root))
+        self.queue_label.setText(self._classification_queue_text())
+        self.progress.setRange(0, max(0, len(self.images) - 1))
+        self.progress.setValue(0)
+        self.schema_badge.setText(
+            "{} class - data don gian".format(len(result.class_names))
+        )
+        self.schema_badge.setStyleSheet(
+            "background:#164E63;color:#A5F3FC;"
+        )
+        self.migrate_button.setVisible(False)
         self.statusBar().showMessage(
-            "Dang doc class_f va ghep split/class..."
+            "Da mo {} anh trong {} class tu {}".format(
+                len(self.images),
+                len(result.class_names),
+                result.root,
+            ),
+            5000,
+        )
+        self.show_current()
+
+    def _scan_classification_dataset(self, root: Path) -> None:
+        self.scan_button.setText("Dang mo class_f...")
+        self._set_busy(
+            True,
+            "Dang doc class_f va ghep split/class...",
+            delayed_overlay=True,
         )
         task = FunctionTask(scan_classification_dataset, root)
         task.signals.succeeded.connect(self._classification_scan_finished)
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(
             lambda: (
-                self.scan_button.setEnabled(True),
+                self._set_busy(False),
                 self.scan_button.setText("Mo class_f"),
             )
         )
         self._start_task(task)
 
     def _classification_scan_finished(self, result: object) -> None:
-        if len(result.class_names) > len(self.class_buttons):
+        if len(result.class_names) > len(CLASS_NAMES):
             self._show_error(
                 "Dataset co {} class, UI hien tai ho tro toi da {}".format(
                     len(result.class_names),
-                    len(self.class_buttons),
+                    len(CLASS_NAMES),
                 )
             )
             return
@@ -969,28 +1125,29 @@ class MainWindow(QMainWindow):
         self.show_current()
 
     def _scan_editor_dataset(self, root: Path) -> None:
-        self.scan_button.setEnabled(False)
         self.scan_button.setText("Dang mo dataset...")
-        self.statusBar().showMessage(
-            "Dang doc data.yaml va ghep cap images/labels..."
+        self._set_busy(
+            True,
+            "Dang doc data.yaml va ghep cap images/labels...",
+            delayed_overlay=True,
         )
         task = FunctionTask(scan_yolo_dataset, root)
         task.signals.succeeded.connect(self._editor_scan_finished)
         task.signals.failed.connect(self._background_failed)
         task.signals.finished.connect(
             lambda: (
-                self.scan_button.setEnabled(True),
+                self._set_busy(False),
                 self.scan_button.setText("Mo dataset YOLO"),
             )
         )
         self._start_task(task)
 
     def _editor_scan_finished(self, result: object) -> None:
-        if len(result.class_names) > len(self.class_buttons):
+        if len(result.class_names) > len(CLASS_NAMES):
             self._show_error(
                 "Dataset co {} class, UI hien tai ho tro toi da {}".format(
                     len(result.class_names),
-                    len(self.class_buttons),
+                    len(CLASS_NAMES),
                 )
             )
             return
@@ -1055,7 +1212,7 @@ class MainWindow(QMainWindow):
             missing = self.images[self.current_index]
             if self.mode == "edit":
                 self._remove_editor_path_from_lists(missing)
-            elif self.mode == "class_edit":
+            elif self.mode in self.CLASSIFICATION_MODES:
                 self._remove_classification_path_from_lists(missing)
             else:
                 self.images.pop(self.current_index)
@@ -1064,7 +1221,7 @@ class MainWindow(QMainWindow):
         if not self.images:
             self.current_path = None
             self.canvas.clear_image()
-            if self.mode in ("edit", "class_edit"):
+            if self.mode in ("edit", *self.CLASSIFICATION_MODES):
                 self.file_label.setText(
                     "Khong co anh trong bo loc {}".format(
                         self._editor_filter_title()
@@ -1080,7 +1237,7 @@ class MainWindow(QMainWindow):
                     if self.mode == "edit"
                     else self._classification_queue_text()
                 )
-                if self.mode in ("edit", "class_edit")
+                if self.mode in ("edit", *self.CLASSIFICATION_MODES)
                 else "0 anh"
             )
             self.progress.setRange(0, 0)
@@ -1088,7 +1245,7 @@ class MainWindow(QMainWindow):
             if self.mode == "edit":
                 self.editor_original_annotations = ()
                 self._update_editor_split_status()
-            elif self.mode == "class_edit":
+            elif self.mode in self.CLASSIFICATION_MODES:
                 self.classification_original_class_id = -1
                 self._update_classification_status()
             return
@@ -1105,19 +1262,21 @@ class MainWindow(QMainWindow):
                 self._editor_queue_text()
                 if self.mode == "edit"
                 else self._classification_queue_text()
-                if self.mode == "class_edit"
+                if self.mode in self.CLASSIFICATION_MODES
                 else "{} anh con lai".format(len(self.images))
             )
         )
         self.progress.setRange(0, max(0, len(self.images) - 1))
         self.progress.setValue(self.current_index)
         self.canvas.reset_annotation()
+        if self.mode in self.CLASSIFICATION_MODES:
+            self._load_classification_sample(self.current_path)
         self._load_image(self.current_path, display=True)
         if self.current_index + 1 < len(self.images):
             self._load_image(self.images[self.current_index + 1], display=False)
         if self.mode == "edit":
             self._update_editor_split_status()
-        elif self.mode == "class_edit":
+        elif self.mode in self.CLASSIFICATION_MODES:
             self._update_classification_status()
 
     def _load_image(self, path: Path, display: bool) -> None:
@@ -1129,7 +1288,7 @@ class MainWindow(QMainWindow):
                 self.canvas.set_image(cached)
                 if self.mode == "edit":
                     self._load_editor_annotations(path, cached)
-                elif self.mode == "class_edit":
+                elif self.mode in self.CLASSIFICATION_MODES:
                     self._load_classification_sample(path)
                 self._bbox_changed(None)
             return
@@ -1176,7 +1335,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_image(image)
             if self.mode == "edit":
                 self._load_editor_annotations(path, image)
-            elif self.mode == "class_edit":
+            elif self.mode in self.CLASSIFICATION_MODES:
                 self._load_classification_sample(path)
             self.statusBar().showMessage(
                 "{} x {} px".format(image.width(), image.height()),
@@ -1248,7 +1407,7 @@ class MainWindow(QMainWindow):
         if self.mode == "edit":
             self.canvas.update_active_class(class_id)
             self._update_object_status()
-        elif self.mode == "class_edit":
+        elif self.mode in self.CLASSIFICATION_MODES:
             self._update_classification_status()
 
     def _select_class_ui(self, class_id: int) -> None:
@@ -1263,7 +1422,7 @@ class MainWindow(QMainWindow):
         )
         self.canvas.set_class_style(
             label,
-            CLASS_COLORS[class_id],
+            self._class_color(class_id),
             class_id,
         )
         self.statusBar().showMessage(
@@ -1318,7 +1477,7 @@ class MainWindow(QMainWindow):
         )
 
     def _update_classification_status(self) -> None:
-        if self.mode != "class_edit":
+        if self.mode not in self.CLASSIFICATION_MODES:
             return
         sample = self.classification_samples_by_path.get(self.current_path)
         if sample is None:
@@ -1331,13 +1490,24 @@ class MainWindow(QMainWindow):
             if 0 <= self.selected_class < len(self.active_class_names)
             else original
         )
-        self.editor_split_status.setText(
-            "Split: {} | Class hien tai: {} | Bo loc: {}".format(
-                sample.split.upper(),
-                original,
-                self._editor_filter_title(),
+        if self.mode == "simple_class":
+            counts = self._simple_class_counts()
+            count = counts[sample.class_id] if sample.class_id < len(counts) else 0
+            self.editor_split_status.setText(
+                "Class hien tai: {}\n{} anh | Bo loc: {}".format(
+                    sample.class_name,
+                    count,
+                    self._editor_filter_title(),
+                )
             )
-        )
+        else:
+            self.editor_split_status.setText(
+                "Split: {} | Class hien tai: {} | Bo loc: {}".format(
+                    sample.split.upper(),
+                    original,
+                    self._editor_filter_title(),
+                )
+            )
         self.bbox_label.setText(
             "Class: {} -> {}{}".format(
                 original,
@@ -1355,7 +1525,7 @@ class MainWindow(QMainWindow):
 
     def _classification_is_dirty(self) -> bool:
         return (
-            self.mode == "class_edit"
+            self.mode in self.CLASSIFICATION_MODES
             and self.current_path is not None
             and 0 <= self.selected_class < len(self.active_class_names)
             and self.selected_class != self.classification_original_class_id
@@ -1392,7 +1562,7 @@ class MainWindow(QMainWindow):
                 3000,
             )
             return
-        if self.mode == "class_edit":
+        if self.mode in self.CLASSIFICATION_MODES:
             if 0 <= self.classification_original_class_id < len(
                 self.active_class_names
             ):
@@ -1414,7 +1584,7 @@ class MainWindow(QMainWindow):
         if self.mode == "edit":
             self._update_object_status()
             return
-        if self.mode == "class_edit":
+        if self.mode in self.CLASSIFICATION_MODES:
             self._update_classification_status()
             return
         if isinstance(value, BBox):
@@ -1430,7 +1600,7 @@ class MainWindow(QMainWindow):
         if self.mode == "edit":
             self._commit_editor_current()
             return
-        if self.mode == "class_edit":
+        if self.mode in self.CLASSIFICATION_MODES:
             self._commit_classification_current()
             return
         if self.selected_class < 0:
@@ -1553,7 +1723,11 @@ class MainWindow(QMainWindow):
         class_id = self.selected_class
         self._set_busy(
             True,
-            "Dang doi class va cap nhat class_f...",
+            (
+                "Dang di chuyen anh sang thu muc class..."
+                if self.mode == "simple_class"
+                else "Dang doi class va cap nhat class_f..."
+            ),
             delayed_overlay=True,
         )
         task = FunctionTask(
@@ -1595,7 +1769,8 @@ class MainWindow(QMainWindow):
             ),
             4000,
         )
-        if self.mode == "class_edit":
+        if self.mode in self.CLASSIFICATION_MODES:
+            self._refresh_simple_class_counts()
             self._apply_classification_filters(
                 next_path,
                 fallback_index=saved_index,
@@ -1607,7 +1782,7 @@ class MainWindow(QMainWindow):
         if self.mode == "edit":
             self._delete_editor_current()
             return
-        if self.mode == "class_edit":
+        if self.mode in self.CLASSIFICATION_MODES:
             self._delete_classification_current()
             return
         path = self.current_path
@@ -1668,7 +1843,11 @@ class MainWindow(QMainWindow):
         path = self.current_path
         self._set_busy(
             True,
-            "Dang archive anh va cap nhat class_f...",
+            (
+                "Dang loai anh khoi data..."
+                if self.mode == "simple_class"
+                else "Dang archive anh va cap nhat class_f..."
+            ),
             delayed_overlay=True,
         )
         task = FunctionTask(
@@ -1685,12 +1864,17 @@ class MainWindow(QMainWindow):
     def _classification_delete_finished(self, path: Path) -> None:
         self._remove_classification_path_from_lists(path)
         self.image_cache.pop(str(path), None)
+        self._refresh_simple_class_counts()
         self.current_index = min(
             self.current_index,
             max(0, len(self.images) - 1),
         )
         self.statusBar().showMessage(
-            "Da xoa anh vao .cvat_nhai_classification_archive",
+            (
+                "Da loai anh khoi data; Ctrl+Z de phuc hoi"
+                if self.mode == "simple_class"
+                else "Da xoa anh vao .cvat_nhai_classification_archive"
+            ),
             5000,
         )
         self.show_current()
@@ -1946,7 +2130,7 @@ class MainWindow(QMainWindow):
                 return
             function = self.editor_manager.undo_latest
             callback = self._editor_undo_finished
-        elif self.mode == "class_edit":
+        elif self.mode in self.CLASSIFICATION_MODES:
             if self.classification_manager is None:
                 return
             function = self.classification_manager.undo_latest
@@ -1957,7 +2141,10 @@ class MainWindow(QMainWindow):
         self._set_busy(
             True,
             "Dang hoan tac...",
-            delayed_overlay=self.mode in ("edit", "class_edit"),
+            delayed_overlay=self.mode in (
+                "edit",
+                *self.CLASSIFICATION_MODES,
+            ),
         )
         task = FunctionTask(function)
         task.signals.succeeded.connect(callback)
@@ -2024,13 +2211,18 @@ class MainWindow(QMainWindow):
                 )
         self.statusBar().showMessage(
             (
-                "Da hoan tac xoa va phuc hoi anh class_f"
+                (
+                    "Da hoan tac xoa va phuc hoi anh"
+                    if self.mode == "simple_class"
+                    else "Da hoan tac xoa va phuc hoi anh class_f"
+                )
                 if result.action == "delete_classification"
                 else "Da hoan tac lan doi class gan nhat"
             ),
             4500,
         )
-        if self.mode == "class_edit":
+        if self.mode in self.CLASSIFICATION_MODES:
+            self._refresh_simple_class_counts()
             self._apply_classification_filters(
                 sample.image_path,
                 fallback_index=self.current_index,
@@ -2099,7 +2291,7 @@ class MainWindow(QMainWindow):
 
     def seek_to_index(self, index: int) -> None:
         if (
-            self.mode not in ("edit", "class_edit")
+            self.mode not in ("edit", *self.CLASSIFICATION_MODES)
             or self.busy
             or not self.images
         ):
@@ -2118,7 +2310,7 @@ class MainWindow(QMainWindow):
         self.show_current()
 
     def _preview_seek_position(self, index: int) -> None:
-        if self.mode in ("edit", "class_edit") and self.images:
+        if self.mode in ("edit", *self.CLASSIFICATION_MODES) and self.images:
             self.position_label.setText(
                 "{} / {}".format(
                     max(0, min(index, len(self.images) - 1)) + 1,
@@ -2140,6 +2332,8 @@ class MainWindow(QMainWindow):
         self.reset_button.setEnabled(not busy)
         self.undo_button.setEnabled(not busy)
         self.scan_button.setEnabled(not busy)
+        self.source_edit.setEnabled(not busy)
+        self.source_browse.setEnabled(not busy)
         self.mode_combo.setEnabled(not busy)
         self.export_button.setEnabled(not busy)
         self.remove_box_button.setEnabled(not busy)
@@ -2227,7 +2421,7 @@ class MainWindow(QMainWindow):
             self._apply_classification_filters(self.current_path)
 
     def _editor_class_filter_changed(self) -> None:
-        if self.mode not in ("edit", "class_edit"):
+        if self.mode not in ("edit", *self.CLASSIFICATION_MODES):
             return
         requested = self.editor_class_filter_combo.currentData()
         if requested != "all":
@@ -2336,8 +2530,13 @@ class MainWindow(QMainWindow):
         sample = self.classification_samples_by_path.get(path)
         if sample is None:
             return len(SPLITS), len(self.active_class_names), str(path).casefold()
+        split_index = (
+            SPLITS.index(sample.split)
+            if sample.split in SPLITS
+            else 0
+        )
         return (
-            SPLITS.index(sample.split),
+            split_index,
             sample.class_id,
             str(path).casefold(),
         )
@@ -2366,11 +2565,18 @@ class MainWindow(QMainWindow):
             self.editor_split_filter == "all"
             and self.editor_class_filter == "all"
         ):
+            if self.mode == "simple_class":
+                return "{} anh data don gian | {} class".format(
+                    len(self.images),
+                    len(self.active_class_names),
+                )
             return "{} anh class_f".format(len(self.images))
-        return "{} anh {} / {} tong".format(
+        suffix = " (data don gian)" if self.mode == "simple_class" else ""
+        return "{} anh {} / {} tong{}".format(
             len(self.images),
             self._editor_filter_title(),
             len(self.classification_all_images),
+            suffix,
         )
 
     def _replace_classification_sample(
@@ -2405,7 +2611,7 @@ class MainWindow(QMainWindow):
         preferred_path: Optional[Path] = None,
         fallback_index: int = 0,
     ) -> None:
-        if self.mode != "class_edit":
+        if self.mode not in self.CLASSIFICATION_MODES:
             return
         self.images = self._classification_filter_images()
         if not self.images:
@@ -2499,6 +2705,23 @@ class MainWindow(QMainWindow):
                 )
                 self.schema_badge.setStyleSheet(
                     "background:#172554;color:#93C5FD;"
+                )
+            self.migrate_button.setVisible(False)
+            return
+        if self.mode == "simple_class":
+            if self.classification_index is None:
+                self.schema_badge.setText("Chua mo data don gian")
+                self.schema_badge.setStyleSheet(
+                    "background:#1E293B;color:#CBD5E1;"
+                )
+            else:
+                self.schema_badge.setText(
+                    "{} class - data don gian".format(
+                        len(self.classification_index.class_names)
+                    )
+                )
+                self.schema_badge.setStyleSheet(
+                    "background:#164E63;color:#A5F3FC;"
                 )
             self.migrate_button.setVisible(False)
             return
@@ -2671,7 +2894,7 @@ class MainWindow(QMainWindow):
             self.undo_latest()
             event.accept()
             return
-        if Qt.Key_1 <= key <= Qt.Key_5:
+        if Qt.Key_1 <= key <= Qt.Key_9:
             self.select_class(key - Qt.Key_1)
             event.accept()
             return

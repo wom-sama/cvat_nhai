@@ -1,7 +1,8 @@
 # CVAT Nhai
 
-Ung dung desktop gan lai nhan anh nhanh cho bo du lieu xoai 5 lop. Moi lan
-nhan `Enter`, tool tao dong thoi:
+Ung dung desktop gan lai nhan anh nhanh. Tool ho tro bo du lieu xoai 5 lop
+YOLO/classification va che do phan loai thu muc don gian voi class dong. Trong
+che do gan nhan bbox, moi lan nhan `Enter`, tool tao dong thoi:
 
 - Anh day du va label YOLO trong `D:\DataAI\AIEx\dataset`.
 - Crop classification trong
@@ -190,6 +191,42 @@ dung ngay.
 
 Anh bi xoa duoc di chuyen vao `work/archive/removed` thay vi xoa vinh vien.
 Dieu nay giu toc do thao tac nhanh nhung van cho phep `Ctrl+Z`.
+
+## Data phan loai don gian
+
+Chon che do `Data phan loai don gian (thu muc class)` va mo thu muc `data`.
+Ten cac thu muc con truc tiep duoc dung lam class, khong con phu thuoc nam
+class xoai co dinh:
+
+```text
+data\
+  class_A\*.jpg
+  class_B\*.jpg
+  class_C\*.jpg
+```
+
+Tool tu sap xep ten class, quet ca anh trong thu muc long ben trong moi class
+va hien so anh ngay tren tung nut. Class 1 den 9 co phim tat; class thu 10 tro
+di chon bang click. Bo loc class, thanh keo tien do, zoom/pan va nhan giu
+`A`/`D` van hoat dong nhu cac editor khac.
+
+- `Enter`: di chuyen anh sang thu muc class dang chon. Duong dan con duoc giu
+  lai; neu trung ten, tool tao hau to `__classeditNNN` va khong ghi de.
+- `F`: bo lua chon class chua luu va tro ve class thu muc ban dau.
+- `Delete`: loai anh khoi thu muc `data`.
+- `Ctrl+Z`: bo thay doi chua luu, hoac phuc hoi lan di chuyen/xoa gan nhat.
+
+Mode nay khong tao hay sua `data.yaml`, `manifest.csv`, split hoac bbox. Anh
+bi `Delete` duoc dua ra archive nam canh dataset:
+
+```text
+<thu_muc_cha>\.cvat_nhai_simple_archive\<dataset_id>\
+```
+
+Archive nam ngoai `data`, nen khong bi framework ImageFolder nhan nham la mot
+class. Tool tu choi anh nam truc tiep o goc `data`, symlink/junction va layout
+YOLO/class_f de tranh mo nham che do. Moi thao tac ghi journal, chay ngoai UI
+thread va rollback duong dan cung bo dem neu ghi journal that bai.
 
 ## Split
 
