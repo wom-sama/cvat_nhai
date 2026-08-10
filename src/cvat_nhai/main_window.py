@@ -50,6 +50,7 @@ from .export_settings_dialog import (
 from .migration import apply_migration
 from .models import (
     BBox,
+    ClassificationDatasetIndex,
     ClassificationSample,
     ClassificationUndoResult,
     DatasetPaths,
@@ -62,6 +63,8 @@ from .seek_slider import SeekSlider
 from .settings_dialog import SettingsDialog
 from .simple_classification_editor import (
     SimpleClassificationEditor,
+    SimpleClassificationExportReport,
+    StagedSimpleClassificationEditor,
     scan_simple_classification_dataset,
 )
 from .workers import FunctionTask
@@ -142,6 +145,16 @@ class MainWindow(QMainWindow):
         self.simple_classification_root = (
             Path(simple_root_value) if simple_root_value else None
         )
+        simple_export_parent_value = str(
+            self.settings.value("simple_classification/export_parent", "")
+        ).strip()
+        self.simple_export_parent = (
+            Path(simple_export_parent_value)
+            if simple_export_parent_value
+            else None
+        )
+        self.simple_deferred_destination: Optional[Path] = None
+        self._reverting_mode_change = False
 
         self.manager = self._make_manager()
         self.mode = "label"
@@ -346,6 +359,64 @@ class MainWindow(QMainWindow):
         self.editor_class_filter_combo.setVisible(False)
         side.addWidget(self.editor_class_filter_combo)
 
+        self.simple_save_mode_label = QLabel("CHE DO LUU")
+        self.simple_save_mode_label.setObjectName("sectionLabel")
+        self.simple_save_mode_label.setVisible(False)
+        side.addWidget(self.simple_save_mode_label)
+        self.simple_deferred_toggle = QPushButton(
+            "Sua truc tiep dataset goc"
+        )
+        self.simple_deferred_toggle.setCheckable(True)
+        self.simple_deferred_toggle.setProperty("saveModeToggle", True)
+        self.simple_deferred_toggle.setToolTip(
+            "Bat de Enter/DEL chi xep thay doi trong bo nho; dataset nguon "
+            "khong bi sua."
+        )
+        self.simple_deferred_toggle.toggled.connect(
+            self._simple_deferred_toggled
+        )
+        self.simple_deferred_toggle.setVisible(False)
+        side.addWidget(self.simple_deferred_toggle)
+
+        self.simple_destination_label = QLabel("DATASET MOI SE TAO")
+        self.simple_destination_label.setObjectName("sectionLabel")
+        self.simple_destination_label.setVisible(False)
+        simple_destination_row = QHBoxLayout()
+        self.simple_destination_edit = QLineEdit()
+        self.simple_destination_edit.setPlaceholderText(
+            "Duong dan dataset moi (phai rong/chua ton tai)"
+        )
+        self.simple_destination_edit.returnPressed.connect(
+            self.apply_simple_deferred_destination
+        )
+        self.simple_destination_edit.textChanged.connect(
+            lambda _text: self._sync_simple_deferred_ui()
+        )
+        self.simple_destination_edit.setVisible(False)
+        self.simple_destination_browse = QToolButton()
+        self.simple_destination_browse.setText("...")
+        self.simple_destination_browse.setToolTip(
+            "Chon thu muc cha; tool tu tao ten dataset moi"
+        )
+        self.simple_destination_browse.clicked.connect(
+            self.choose_simple_deferred_destination
+        )
+        self.simple_destination_browse.setVisible(False)
+        simple_destination_row.addWidget(self.simple_destination_edit)
+        simple_destination_row.addWidget(self.simple_destination_browse)
+        self.simple_deferred_hint = QLabel("")
+        self.simple_deferred_hint.setObjectName("muted")
+        self.simple_deferred_hint.setWordWrap(True)
+        self.simple_deferred_hint.setVisible(False)
+        self.simple_publish_button = QPushButton(
+            "XAC NHAN  Tao dataset da sua"
+        )
+        self.simple_publish_button.setObjectName("primaryButton")
+        self.simple_publish_button.clicked.connect(
+            self.export_simple_deferred_dataset
+        )
+        self.simple_publish_button.setVisible(False)
+
         self.export_button = QPushButton(
             "Xuat yolo_f + class_f"
         )
@@ -362,6 +433,10 @@ class MainWindow(QMainWindow):
         self.class_button_layout.setSpacing(12)
         side.addWidget(self.class_button_container)
         self._ensure_class_button_count(len(CLASS_NAMES))
+        side.addWidget(self.simple_destination_label)
+        side.addLayout(simple_destination_row)
+        side.addWidget(self.simple_deferred_hint)
+        side.addWidget(self.simple_publish_button)
 
         split_row = QHBoxLayout()
         self.split_label = QLabel("Split:")
@@ -546,6 +621,12 @@ class MainWindow(QMainWindow):
                 border-color: #475569;
             }
             QPushButton:disabled { color: #64748B; background: #172033; }
+            QPushButton[saveModeToggle="true"]:checked {
+                background: #123524;
+                border: 2px solid #22C55E;
+                color: #BBF7D0;
+                font-weight: 700;
+            }
             QPushButton[classButton="true"] {
                 text-align: left;
                 padding: 8px 12px;
@@ -618,8 +699,25 @@ class MainWindow(QMainWindow):
             self.scan_source()
 
     def _mode_changed(self) -> None:
+        if self._reverting_mode_change:
+            return
         mode = str(self.mode_combo.currentData())
         if mode == self.mode:
+            return
+        if (
+            self.mode == "simple_class"
+            and self._simple_session_has_unsaved_changes()
+            and not self._confirm_discard_simple_staging(
+                "doi sang che do khac"
+            )
+        ):
+            self._reverting_mode_change = True
+            try:
+                self.mode_combo.setCurrentIndex(
+                    self.mode_combo.findData(self.mode)
+                )
+            finally:
+                self._reverting_mode_change = False
             return
         self.mode = mode
         self._stop_continuous_navigation()
@@ -745,6 +843,288 @@ class MainWindow(QMainWindow):
         )
         self._configure_class_buttons(() if simple_editing else CLASS_NAMES)
         self._update_schema_status()
+        self._sync_simple_deferred_ui()
+
+    def _staged_simple_manager(
+        self,
+    ) -> Optional[StagedSimpleClassificationEditor]:
+        manager = self.classification_manager
+        return (
+            manager
+            if isinstance(manager, StagedSimpleClassificationEditor)
+            else None
+        )
+
+    def _simple_session_has_unsaved_changes(self) -> bool:
+        manager = self._staged_simple_manager()
+        return bool(
+            self.mode == "simple_class"
+            and (
+                (manager is not None and manager.has_unexported_changes)
+                or self._classification_is_dirty()
+            )
+        )
+
+    def _confirm_discard_simple_staging(self, action: str) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Bo thay doi chua xuat?",
+            (
+                "Phien luu ban sao con thay doi chua duoc tao thanh dataset "
+                "moi.\nDataset nguon van nguyen ven.\n\n"
+                "Bo cac thay doi staging de {}?"
+            ).format(action),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
+
+    def _simple_deferred_toggled(self, checked: bool) -> None:
+        if self.busy:
+            return
+        if self.mode != "simple_class":
+            self._sync_simple_deferred_ui()
+            return
+        if (
+            not checked
+            and self._simple_session_has_unsaved_changes()
+            and not self._confirm_discard_simple_staging(
+                "tat che do luu ban sao"
+            )
+        ):
+            self.simple_deferred_toggle.blockSignals(True)
+            self.simple_deferred_toggle.setChecked(True)
+            self.simple_deferred_toggle.blockSignals(False)
+            self._sync_simple_deferred_ui()
+            return
+        if self.classification_index is not None:
+            try:
+                if checked:
+                    index = self._current_simple_classification_index()
+                    manager = StagedSimpleClassificationEditor(index)
+                    self.classification_index = index
+                else:
+                    manager = SimpleClassificationEditor(
+                        self.classification_index
+                    )
+                self._install_simple_classification_manager(manager)
+            except Exception as error:
+                self._show_error(str(error))
+                self.simple_deferred_toggle.blockSignals(True)
+                self.simple_deferred_toggle.setChecked(not checked)
+                self.simple_deferred_toggle.blockSignals(False)
+                self._sync_simple_deferred_ui()
+                return
+        if not checked:
+            self.simple_deferred_destination = None
+            self.simple_destination_edit.clear()
+        self._sync_simple_deferred_ui()
+        self._update_schema_status()
+        if checked and not self.simple_destination_edit.text().strip():
+            QTimer.singleShot(0, self.choose_simple_deferred_destination)
+
+    def _current_simple_classification_index(
+        self,
+    ) -> ClassificationDatasetIndex:
+        if self.classification_index is None:
+            raise RuntimeError("Chua mo data phan loai don gian")
+        samples = tuple(
+            sorted(
+                self.classification_samples_by_path.values(),
+                key=lambda sample: (
+                    sample.class_id,
+                    str(sample.image_path).casefold(),
+                ),
+            )
+        )
+        return ClassificationDatasetIndex(
+            root=self.classification_index.root,
+            data_yaml=None,
+            class_names=tuple(self.classification_index.class_names),
+            samples=samples,
+        )
+
+    def _install_simple_classification_manager(self, manager) -> None:
+        if self.classification_index is None:
+            return
+        preferred_path = self.current_path
+        self.classification_manager = manager
+        self.classification_samples_by_path = {
+            sample.image_path: sample
+            for sample in self.classification_index.samples
+        }
+        self.classification_all_images = [
+            sample.image_path for sample in self.classification_index.samples
+        ]
+        self._refresh_simple_class_counts()
+        self._apply_classification_filters(
+            preferred_path,
+            fallback_index=self.current_index,
+        )
+
+    def _sync_simple_deferred_ui(self) -> None:
+        simple_mode = self.mode == "simple_class"
+        enabled = simple_mode and self.simple_deferred_toggle.isChecked()
+        self.simple_save_mode_label.setVisible(simple_mode)
+        self.simple_deferred_toggle.setVisible(simple_mode)
+        self.simple_destination_label.setVisible(enabled)
+        self.simple_destination_edit.setVisible(enabled)
+        self.simple_destination_browse.setVisible(enabled)
+        self.simple_deferred_hint.setVisible(enabled)
+        self.simple_publish_button.setVisible(enabled)
+        self.simple_deferred_toggle.setText(
+            "DANG BAT  Luu thanh dataset moi"
+            if enabled
+            else "Sua truc tiep dataset goc"
+        )
+        manager = self._staged_simple_manager()
+        if enabled and manager is None:
+            hint = "Mo dataset de bat dau phien sua khong cham vao data nguon."
+        elif enabled:
+            hint = (
+                "Nguon giu nguyen | {} doi class | {} loai bo. "
+                "Enter/DEL chi xep thay doi trong bo nho."
+            ).format(manager.changed_count, manager.deleted_count)
+        else:
+            hint = ""
+        self.simple_deferred_hint.setText(hint)
+        pending = bool(manager is not None and manager.has_unexported_changes)
+        self.simple_publish_button.setText(
+            "XAC NHAN  Tao dataset moi ({} thay doi)".format(
+                manager.staged_change_count if manager is not None else 0
+            )
+        )
+        self.simple_publish_button.setEnabled(
+            enabled
+            and not self.busy
+            and pending
+            and bool(self.simple_destination_edit.text().strip())
+            and not self._classification_is_dirty()
+        )
+        self.simple_destination_edit.setEnabled(enabled and not self.busy)
+        self.simple_destination_browse.setEnabled(enabled and not self.busy)
+        self.simple_deferred_toggle.setEnabled(not self.busy)
+        if simple_mode:
+            self.commit_button.setText(
+                "ENTER  Xep thay doi va sang anh"
+                if enabled
+                else "ENTER  Ap dung class"
+            )
+            self.delete_button.setText(
+                "DEL  Loai khoi ban dataset moi"
+                if enabled
+                else "DEL  Loai bo khoi data"
+            )
+            self.help_text.setText(
+                (
+                    "Phim 1-9/click: doi class   |   ENTER/DEL: xep thay "
+                    "doi   |   XAC NHAN: tao dataset moi   |   F: ve class "
+                    "hien tai   |   Ctrl+Z: hoan tac   |   Giu A/D: dieu huong"
+                )
+                if enabled
+                else (
+                    "Phim 1-9/click: doi class   |   ENTER: ap dung   |   "
+                    "F: ve class goc   |   DEL: loai anh   |   "
+                    "Ctrl+Z: hoan tac   |   Wheel: zoom   |   "
+                    "Space+drag: pan   |   Giu A/D: anh truoc/sau"
+                )
+            )
+
+    def choose_simple_deferred_destination(self) -> None:
+        if (
+            self.mode != "simple_class"
+            or not self.simple_deferred_toggle.isChecked()
+        ):
+            return
+        if self.simple_export_parent is not None:
+            initial = self.simple_export_parent
+        elif self.classification_index is not None:
+            initial = self.classification_index.root.parent
+        else:
+            initial = Path.home()
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Chon thu muc cha de tao dataset moi",
+            str(initial),
+        )
+        if not folder:
+            self._sync_simple_deferred_ui()
+            return
+        try:
+            parent = Path(folder).expanduser().resolve()
+            destination = self._suggest_simple_deferred_destination(parent)
+        except Exception as error:
+            self.simple_deferred_destination = None
+            self._sync_simple_deferred_ui()
+            self._show_error(str(error))
+            return
+        self.simple_export_parent = parent
+        self.settings.setValue(
+            "simple_classification/export_parent",
+            str(parent),
+        )
+        self.simple_deferred_destination = destination
+        self.simple_destination_edit.setText(str(destination))
+        self.simple_destination_edit.setCursorPosition(0)
+        self.simple_destination_edit.setToolTip(str(destination))
+        self._sync_simple_deferred_ui()
+        self.statusBar().showMessage(
+            "Dataset moi se duoc tao tai {}".format(destination),
+            5000,
+        )
+
+    def _suggest_simple_deferred_destination(self, parent: Path) -> Path:
+        source_name = (
+            self.classification_index.root.name
+            if self.classification_index is not None
+            else "data"
+        )
+        base_name = "{}_edited".format(source_name)
+        candidate = parent / base_name
+        for index in range(10000):
+            value = (
+                candidate
+                if index == 0
+                else parent / "{}_{:03d}".format(base_name, index)
+            )
+            if not value.exists():
+                return value.resolve(strict=False)
+        raise RuntimeError("Khong tao duoc ten dataset dich khong trung")
+
+    def apply_simple_deferred_destination(self) -> None:
+        text = self.simple_destination_edit.text().strip()
+        if not text:
+            self.simple_deferred_destination = None
+            self._sync_simple_deferred_ui()
+            self.statusBar().showMessage("Chon duong dan dataset moi", 3000)
+            return
+        try:
+            destination = Path(text).expanduser().resolve(strict=False)
+            invalid_existing = destination.exists() and (
+                not destination.is_dir() or any(destination.iterdir())
+            )
+        except (OSError, RuntimeError) as error:
+            self.simple_deferred_destination = None
+            self._sync_simple_deferred_ui()
+            self._show_error(
+                "Khong doc duoc thu muc dataset dich: {}".format(error)
+            )
+            return
+        if invalid_existing:
+            self._show_error(
+                "Thu muc dataset dich phai rong hoac chua ton tai"
+            )
+            self.simple_deferred_destination = None
+            self._sync_simple_deferred_ui()
+            return
+        self.simple_deferred_destination = destination
+        self.simple_destination_edit.setText(str(destination))
+        self.simple_destination_edit.setToolTip(str(destination))
+        self._sync_simple_deferred_ui()
+        self.statusBar().showMessage(
+            "Da chon dataset moi: {}".format(destination),
+            4000,
+        )
 
     def _class_color(self, class_id: int) -> str:
         if 0 <= class_id < len(CLASS_COLORS):
@@ -967,6 +1347,17 @@ class MainWindow(QMainWindow):
             self._scan_classification_dataset(root)
             return
         if self.mode == "simple_class":
+            if (
+                self._simple_session_has_unsaved_changes()
+                and not self._confirm_discard_simple_staging(
+                    "mo dataset khac"
+                )
+            ):
+                if self.classification_index is not None:
+                    self.source_edit.setText(
+                        str(self.classification_index.root)
+                    )
+                return
             self._scan_simple_classification_dataset(root)
             return
         self.source_root = root.resolve()
@@ -1018,7 +1409,11 @@ class MainWindow(QMainWindow):
 
     def _simple_classification_scan_finished(self, result: object) -> None:
         try:
-            manager = SimpleClassificationEditor(result)
+            manager = (
+                StagedSimpleClassificationEditor(result)
+                if self.simple_deferred_toggle.isChecked()
+                else SimpleClassificationEditor(result)
+            )
         except Exception as error:
             self._show_error(str(error))
             return
@@ -1062,6 +1457,8 @@ class MainWindow(QMainWindow):
             ),
             5000,
         )
+        self._sync_simple_deferred_ui()
+        self._update_schema_status()
         self.show_current()
 
     def _scan_classification_dataset(self, root: Path) -> None:
@@ -1414,6 +1811,8 @@ class MainWindow(QMainWindow):
             self._update_object_status()
         elif self.mode in self.CLASSIFICATION_MODES:
             self._update_classification_status()
+            if self.mode == "simple_class":
+                self._sync_simple_deferred_ui()
 
     def _select_class_ui(self, class_id: int) -> None:
         self.selected_class = class_id
@@ -1573,6 +1972,8 @@ class MainWindow(QMainWindow):
             ):
                 self._select_class_ui(self.classification_original_class_id)
             self._update_classification_status()
+            if self.mode == "simple_class":
+                self._sync_simple_deferred_ui()
             self.statusBar().showMessage(
                 "Da khoi phuc class goc cua anh hien tai",
                 3000,
@@ -1726,6 +2127,15 @@ class MainWindow(QMainWindow):
             return
         path = self.current_path
         class_id = self.selected_class
+        staged_manager = self._staged_simple_manager()
+        if staged_manager is not None:
+            try:
+                result = staged_manager.change_class(sample, class_id)
+            except Exception as error:
+                self._show_error(str(error))
+                return
+            self._classification_save_finished(path, result)
+            return
         self._set_busy(
             True,
             (
@@ -1769,9 +2179,11 @@ class MainWindow(QMainWindow):
         )
         self._replace_classification_sample(old_path, result)
         self.statusBar().showMessage(
-            "Da doi class sang {}".format(
-                self._class_filter_title(result.class_id)
-            ),
+            (
+                "Da xep doi class sang {}; dataset nguon chua bi sua"
+                if self._staged_simple_manager() is not None
+                else "Da doi class sang {}"
+            ).format(self._class_filter_title(result.class_id)),
             4000,
         )
         if self.mode in self.CLASSIFICATION_MODES:
@@ -1780,6 +2192,8 @@ class MainWindow(QMainWindow):
                 next_path,
                 fallback_index=saved_index,
             )
+            if self.mode == "simple_class":
+                self._sync_simple_deferred_ui()
 
     def delete_current(self) -> None:
         if self.busy or self.current_path is None:
@@ -1846,6 +2260,15 @@ class MainWindow(QMainWindow):
         if sample is None:
             return
         path = self.current_path
+        staged_manager = self._staged_simple_manager()
+        if staged_manager is not None:
+            try:
+                staged_manager.delete_sample(sample)
+            except Exception as error:
+                self._show_error(str(error))
+                return
+            self._classification_delete_finished(path)
+            return
         self._set_busy(
             True,
             (
@@ -1876,13 +2299,17 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage(
             (
-                "Da loai anh khoi data; Ctrl+Z de phuc hoi"
+                "Da danh dau loai khoi ban moi; anh nguon van duoc giu"
+                if self._staged_simple_manager() is not None
+                else "Da loai anh khoi data; Ctrl+Z de phuc hoi"
                 if self.mode == "simple_class"
                 else "Da xoa anh vao .cvat_nhai_classification_archive"
             ),
             5000,
         )
         self.show_current()
+        if self.mode == "simple_class":
+            self._sync_simple_deferred_ui()
 
     def remove_active_box(self) -> None:
         if self.mode != "edit" or self.busy:
@@ -1893,6 +2320,87 @@ class MainWindow(QMainWindow):
                 "Da xoa box trong bo nho; Enter de ap dung, F de phuc hoi",
                 4000,
             )
+
+    def export_simple_deferred_dataset(self) -> None:
+        manager = self._staged_simple_manager()
+        if self.mode != "simple_class" or manager is None or self.busy:
+            return
+        if self._classification_is_dirty():
+            self.statusBar().showMessage(
+                "Class hien tai chua xep: nhan Enter hoac F truoc khi tao data",
+                5000,
+            )
+            return
+        if not manager.has_unexported_changes:
+            self.statusBar().showMessage(
+                "Khong co thay doi moi de xuat",
+                3500,
+            )
+            return
+        self.apply_simple_deferred_destination()
+        destination = self.simple_deferred_destination
+        if destination is None:
+            return
+        self._set_busy(
+            True,
+            "Dang tao dataset moi; dataset nguon duoc giu nguyen...",
+        )
+        task = FunctionTask(
+            manager.export_dataset,
+            destination,
+            report_progress=True,
+        )
+        self.export_task = task
+        dialog = ExportProgressDialog(self)
+        self.export_progress_dialog = dialog
+        dialog.cancel_requested.connect(task.cancel)
+        task.signals.progress.connect(dialog.update_progress)
+        task.signals.succeeded.connect(self._simple_export_finished)
+        task.signals.failed.connect(self._export_failed)
+        task.signals.finished.connect(self._export_task_finished)
+        self._ensure_window_visible()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        QTimer.singleShot(
+            0,
+            lambda value=task: self._start_task(value),
+        )
+
+    def _simple_export_finished(self, result: object) -> None:
+        if not isinstance(result, SimpleClassificationExportReport):
+            return
+        manager = self._staged_simple_manager()
+        if manager is None:
+            return
+        try:
+            manager.mark_exported(result.revision)
+        except Exception as error:
+            self._show_error(str(error))
+            return
+        if self.export_progress_dialog is not None:
+            self.export_progress_dialog.finish()
+        self.simple_deferred_destination = None
+        self.simple_destination_edit.clear()
+        self._sync_simple_deferred_ui()
+        QMessageBox.information(
+            self,
+            "Da tao dataset moi",
+            (
+                "Da sao chep {} anh vao dataset moi.\n"
+                "Doi class: {} | Loai bo: {}\n"
+                "Dataset nguon khong bi thay doi.\n\n{}"
+            ).format(
+                result.images,
+                result.changed,
+                result.deleted,
+                result.destination,
+            ),
+        )
+        self.statusBar().showMessage(
+            "Da tao dataset moi tai {}".format(result.destination),
+            7000,
+        )
 
     def export_editor_dataset(self) -> None:
         if self.mode != "edit" or self.editor_index is None or self.busy:
@@ -2138,6 +2646,16 @@ class MainWindow(QMainWindow):
         elif self.mode in self.CLASSIFICATION_MODES:
             if self.classification_manager is None:
                 return
+            staged_manager = self._staged_simple_manager()
+            if staged_manager is not None:
+                try:
+                    result = staged_manager.undo_latest()
+                except Exception as error:
+                    self._show_error(str(error))
+                    return
+                self._classification_undo_finished(result)
+                self._sync_simple_deferred_ui()
+                return
             function = self.classification_manager.undo_latest
             callback = self._classification_undo_finished
         else:
@@ -2217,12 +2735,18 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             (
                 (
-                    "Da hoan tac xoa va phuc hoi anh"
+                    "Da hoan tac danh dau loai; anh nguon khong doi"
+                    if self._staged_simple_manager() is not None
+                    else "Da hoan tac xoa va phuc hoi anh"
                     if self.mode == "simple_class"
                     else "Da hoan tac xoa va phuc hoi anh class_f"
                 )
                 if result.action == "delete_classification"
-                else "Da hoan tac lan doi class gan nhat"
+                else (
+                    "Da hoan tac doi class trong phien staging"
+                    if self._staged_simple_manager() is not None
+                    else "Da hoan tac lan doi class gan nhat"
+                )
             ),
             4500,
         )
@@ -2232,6 +2756,8 @@ class MainWindow(QMainWindow):
                 sample.image_path,
                 fallback_index=self.current_index,
             )
+            if self.mode == "simple_class":
+                self._sync_simple_deferred_ui()
 
     def navigate(self, delta: int) -> bool:
         if self.busy or not self.images:
@@ -2341,6 +2867,10 @@ class MainWindow(QMainWindow):
         self.source_browse.setEnabled(not busy)
         self.mode_combo.setEnabled(not busy)
         self.export_button.setEnabled(not busy)
+        self.simple_deferred_toggle.setEnabled(not busy)
+        self.simple_destination_edit.setEnabled(not busy)
+        self.simple_destination_browse.setEnabled(not busy)
+        self.simple_publish_button.setEnabled(not busy)
         self.remove_box_button.setEnabled(not busy)
         self.editor_split_filter_combo.setEnabled(not busy)
         self.editor_class_filter_combo.setEnabled(not busy)
@@ -2361,6 +2891,7 @@ class MainWindow(QMainWindow):
             self.busy_overlay_timer.stop()
             self.busy_overlay_message = ""
             self.busy_overlay.hide()
+        self._sync_simple_deferred_ui()
 
     def _show_delayed_busy_overlay(self) -> None:
         if self.busy:
@@ -2535,6 +3066,8 @@ class MainWindow(QMainWindow):
         sample = self.classification_samples_by_path.get(path)
         if sample is None:
             return len(SPLITS), len(self.active_class_names), str(path).casefold()
+        if self._staged_simple_manager() is not None:
+            return 0, 0, str(path).casefold()
         split_index = (
             SPLITS.index(sample.split)
             if sample.split in SPLITS
@@ -2595,6 +3128,9 @@ class MainWindow(QMainWindow):
             sample.image_path if value == old_path else value
             for value in self.classification_all_images
         ]
+        self.classification_all_images.sort(
+            key=self._classification_path_sort_key
+        )
         self.images = [
             sample.image_path if value == old_path else value
             for value in self.images
@@ -2714,15 +3250,21 @@ class MainWindow(QMainWindow):
             self.migrate_button.setVisible(False)
             return
         if self.mode == "simple_class":
+            staged = self.simple_deferred_toggle.isChecked()
             if self.classification_index is None:
-                self.schema_badge.setText("Chua mo data don gian")
+                self.schema_badge.setText(
+                    "Chua mo data don gian{}".format(
+                        " - luu ban sao" if staged else ""
+                    )
+                )
                 self.schema_badge.setStyleSheet(
                     "background:#1E293B;color:#CBD5E1;"
                 )
             else:
                 self.schema_badge.setText(
-                    "{} class - data don gian".format(
-                        len(self.classification_index.class_names)
+                    "{} class - data don gian{}".format(
+                        len(self.classification_index.class_names),
+                        " - staging" if staged else "",
                     )
                 )
                 self.schema_badge.setStyleSheet(
@@ -2870,6 +3412,12 @@ class MainWindow(QMainWindow):
                 "Dang hoan tat giao dich du lieu; vui long doi trong giay lat",
                 3000,
             )
+            event.ignore()
+            return
+        if (
+            self._simple_session_has_unsaved_changes()
+            and not self._confirm_discard_simple_staging("dong ung dung")
+        ):
             event.ignore()
             return
         if self.export_destination_dialog is not None:

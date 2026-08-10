@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cvat-nhai"
-version = "1.6.0"
+version = "1.7.0"
 description = "Fast desktop relabeling tool for YOLO and classification-folder image datasets"
 readme = "README.md"
 requires-python = ">=3.9"

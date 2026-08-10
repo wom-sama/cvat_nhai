@@ -3,10 +3,15 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QMessageBox
 
 import cvat_nhai.main_window as main_window_module
+import cvat_nhai.simple_classification_editor as simple_editor_module
 from cvat_nhai.constants import CLASS_NAMES
 from cvat_nhai.main_window import MainWindow
+from cvat_nhai.simple_classification_editor import (
+    StagedSimpleClassificationEditor,
+)
 
 
 def _image(path: Path, color: str = "green") -> Path:
@@ -377,6 +382,7 @@ def test_simple_mode_switch_restores_legacy_buttons_and_saved_root(
     qtbot.waitUntil(lambda: not window.active_tasks, timeout=5000)
     assert len(window.class_buttons) == 12
     assert all(button.isVisible() for button in window.class_buttons)
+    assert window.simple_deferred_toggle.isVisible()
 
     window.mode_combo.setCurrentIndex(window.mode_combo.findData("label"))
     assert window.active_class_names == CLASS_NAMES
@@ -384,6 +390,7 @@ def test_simple_mode_switch_restores_legacy_buttons_and_saved_root(
     assert all(button.isHidden() for button in window.class_buttons[5:])
     assert window.canvas._annotation_enabled
     assert window.editor_class_filter_combo.isHidden()
+    assert window.simple_deferred_toggle.isHidden()
 
     window.mode_combo.setCurrentIndex(
         window.mode_combo.findData("simple_class")
@@ -392,6 +399,7 @@ def test_simple_mode_switch_restores_legacy_buttons_and_saved_root(
     assert window.active_class_names == ()
     assert all(button.isHidden() for button in window.class_buttons)
     assert not window.canvas._annotation_enabled
+    assert window.simple_deferred_toggle.isVisible()
 
 
 def test_corrupt_image_can_be_skipped_deleted_and_restored(
@@ -529,3 +537,396 @@ def test_failed_rescan_preserves_open_dataset_and_controls(
     assert valid_image.is_file()
     assert window.scan_button.isEnabled()
     assert window.mode_combo.isEnabled()
+
+
+def _snapshot_files(root: Path):
+    return {
+        path.relative_to(root): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _enable_staged_mode(
+    window: MainWindow,
+    export_parent: Path,
+    monkeypatch,
+    qtbot,
+) -> Path:
+    export_parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getExistingDirectory",
+        lambda *args, **kwargs: str(export_parent),
+    )
+    window.simple_deferred_toggle.click()
+    qtbot.waitUntil(
+        lambda: bool(window.simple_destination_edit.text()),
+        timeout=3000,
+    )
+    return Path(window.simple_destination_edit.text())
+
+
+def test_staged_mode_enter_delete_export_keeps_source_byte_exact(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    first = _image(root / "a" / "a.jpg", "green")
+    second = _image(root / "a" / "b.jpg", "orange")
+    third = _image(root / "b" / "c.jpg", "red")
+    before = _snapshot_files(root)
+    messages = []
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "information",
+        lambda *args, **kwargs: messages.append(args[2]),
+    )
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.Yes,
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    _open_simple_mode(window, root)
+    qtbot.waitUntil(
+        lambda: window.current_path == first and not window.active_tasks,
+        timeout=5000,
+    )
+    destination = _enable_staged_mode(
+        window,
+        tmp_path / "exports",
+        monkeypatch,
+        qtbot,
+    )
+
+    assert isinstance(
+        window.classification_manager,
+        StagedSimpleClassificationEditor,
+    )
+    assert window.simple_publish_button.isVisible()
+    assert not window.simple_publish_button.isEnabled()
+    window.select_class(1)
+    window.commit_current()
+
+    assert first.is_file()
+    assert window.current_path == second
+    assert window.classification_samples_by_path[first].class_id == 1
+    assert window.classification_manager.class_counts == (1, 2)
+    assert window.simple_publish_button.isEnabled()
+    assert not window.busy
+
+    window.delete_current()
+    assert second.is_file()
+    assert second not in window.classification_samples_by_path
+    assert window.current_path == third
+    assert window.classification_manager.class_counts == (0, 2)
+    assert "1 loai bo" in window.simple_deferred_hint.text()
+    assert _snapshot_files(root) == before
+
+    window.simple_publish_button.click()
+    qtbot.waitUntil(
+        lambda: (
+            window.export_progress_dialog is not None
+            and window.export_progress_dialog.isVisible()
+        ),
+        timeout=3000,
+    )
+    qtbot.waitUntil(
+        lambda: (
+            window.export_task is None
+            and destination.is_dir()
+            and not window.busy
+        ),
+        timeout=10000,
+    )
+
+    assert (destination / "b" / "a.jpg").read_bytes() == first.read_bytes()
+    assert (destination / "b" / "c.jpg").read_bytes() == third.read_bytes()
+    assert not list((destination / "a").rglob("*.*"))
+    assert not (destination / "a" / "b.jpg").exists()
+    assert _snapshot_files(root) == before
+    assert messages and "Dataset nguon khong bi thay doi" in messages[0]
+    assert not window.classification_manager.has_unexported_changes
+    assert not window.simple_destination_edit.text()
+    assert not window.simple_publish_button.isEnabled()
+
+
+def test_staged_export_cancel_cleans_partial_output_and_recovers_ui(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    paths = [
+        _image(root / "a" / f"image_{index:02d}.png", "green")
+        for index in range(12)
+    ]
+    (root / "b").mkdir(parents=True)
+    before = _snapshot_files(root)
+    original_copy = simple_editor_module.shutil.copy2
+
+    def slow_copy(source, target):
+        time.sleep(0.04)
+        return original_copy(source, target)
+
+    monkeypatch.setattr(simple_editor_module.shutil, "copy2", slow_copy)
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.Yes,
+    )
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    _open_simple_mode(window, root)
+    qtbot.waitUntil(
+        lambda: window.current_path == paths[0] and not window.active_tasks,
+        timeout=5000,
+    )
+    destination = _enable_staged_mode(
+        window,
+        tmp_path / "exports",
+        monkeypatch,
+        qtbot,
+    )
+    window.select_class(1)
+    window.commit_current()
+    window.simple_publish_button.click()
+    qtbot.waitUntil(
+        lambda: window.export_progress_dialog is not None,
+        timeout=3000,
+    )
+    dialog = window.export_progress_dialog
+    assert dialog is not None
+    qtbot.waitUntil(
+        lambda: dialog.progress_bar.value() >= 1,
+        timeout=5000,
+    )
+    dialog.request_cancel()
+    qtbot.waitUntil(
+        lambda: window.export_task is None and not window.busy,
+        timeout=10000,
+    )
+
+    assert not destination.exists()
+    assert not list((tmp_path / "exports").glob(".cvat_nhai_simple_export_*"))
+    assert _snapshot_files(root) == before
+    assert window.simple_publish_button.isEnabled()
+    assert window.mode_combo.isEnabled()
+    assert window.classification_manager.has_unexported_changes
+    window.simple_deferred_toggle.click()
+    assert not window.simple_deferred_toggle.isChecked()
+
+
+def test_staged_mode_refuses_discard_and_mode_switch_until_confirmed(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    source = _image(root / "a" / "one.png", "green")
+    (root / "b").mkdir(parents=True)
+    answers = [QMessageBox.No, QMessageBox.No, QMessageBox.Yes]
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: answers.pop(0),
+    )
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    _open_simple_mode(window, root)
+    qtbot.waitUntil(
+        lambda: window.current_path == source and not window.active_tasks,
+        timeout=5000,
+    )
+    _enable_staged_mode(window, tmp_path / "exports", monkeypatch, qtbot)
+    window.select_class(1)
+    window.commit_current()
+
+    window.simple_deferred_toggle.click()
+    assert window.simple_deferred_toggle.isChecked()
+    assert isinstance(
+        window.classification_manager,
+        StagedSimpleClassificationEditor,
+    )
+    window.mode_combo.setCurrentIndex(window.mode_combo.findData("label"))
+    assert window.mode == "simple_class"
+    assert window.mode_combo.currentData() == "simple_class"
+
+    window.simple_deferred_toggle.click()
+    assert not window.simple_deferred_toggle.isChecked()
+    assert not isinstance(
+        window.classification_manager,
+        StagedSimpleClassificationEditor,
+    )
+    assert window.classification_samples_by_path[source].class_id == 0
+    assert source.is_file()
+
+
+def test_staged_mode_can_be_enabled_before_scan_and_close_is_guarded(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    source = _image(root / "a" / "one.png", "green")
+    (root / "b").mkdir(parents=True)
+    export_parent = tmp_path / "exports"
+    export_parent.mkdir()
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getExistingDirectory",
+        lambda *args, **kwargs: str(export_parent),
+    )
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.mode_combo.setCurrentIndex(window.mode_combo.findData("simple_class"))
+    window.simple_deferred_toggle.click()
+    qtbot.waitUntil(
+        lambda: bool(window.simple_destination_edit.text()),
+        timeout=3000,
+    )
+    window.source_edit.setText(str(root))
+    window.scan_source()
+    qtbot.waitUntil(
+        lambda: window.current_path == source and not window.active_tasks,
+        timeout=5000,
+    )
+    assert isinstance(
+        window.classification_manager,
+        StagedSimpleClassificationEditor,
+    )
+    window.select_class(1)
+    window.commit_current()
+
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.No,
+    )
+    assert not window.close()
+    assert window.isVisible()
+    assert source.is_file()
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.Yes,
+    )
+    assert window.close()
+
+
+def test_staged_export_blocks_dirty_class_and_recovers_from_missing_source(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    first = _image(root / "a" / "a.png", "green")
+    second = _image(root / "a" / "b.png", "orange")
+    (root / "b").mkdir(parents=True)
+    errors = []
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.Yes,
+    )
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    monkeypatch.setattr(window, "_show_error", errors.append)
+    _open_simple_mode(window, root)
+    qtbot.waitUntil(
+        lambda: window.current_path == first and not window.active_tasks,
+        timeout=5000,
+    )
+    destination = _enable_staged_mode(
+        window,
+        tmp_path / "exports",
+        monkeypatch,
+        qtbot,
+    )
+    window.select_class(1)
+    window.commit_current()
+    assert window.current_path == second
+    window.select_class(1)
+    assert window._classification_is_dirty()
+    assert not window.simple_publish_button.isEnabled()
+    window.export_simple_deferred_dataset()
+    assert window.export_task is None
+    assert "chua xep" in window.statusBar().currentMessage()
+
+    window.reset_annotation()
+    first.unlink()
+    window.simple_publish_button.click()
+    qtbot.waitUntil(
+        lambda: bool(errors) and window.export_task is None and not window.busy,
+        timeout=10000,
+    )
+
+    assert "khong con ton tai" in errors[-1]
+    assert not destination.exists()
+    assert window.mode_combo.isEnabled()
+    assert window.simple_publish_button.isEnabled()
+    window.simple_deferred_toggle.click()
+
+
+def test_staged_filter_counts_and_lifo_undo_use_effective_classes(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    class_a = [
+        _image(root / "a" / f"a_{index}.png", "green")
+        for index in range(3)
+    ]
+    class_b = _image(root / "b" / "b.png", "orange")
+    before = _snapshot_files(root)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    _open_simple_mode(window, root)
+    qtbot.waitUntil(
+        lambda: window.current_path == class_a[0] and not window.active_tasks,
+        timeout=5000,
+    )
+    _enable_staged_mode(window, tmp_path / "exports", monkeypatch, qtbot)
+    window.editor_class_filter_combo.setCurrentIndex(
+        window.editor_class_filter_combo.findData(0)
+    )
+    assert window.images == class_a
+
+    window.select_class(1)
+    window.commit_current()
+    assert window.images == class_a[1:]
+    assert window.current_path == class_a[1]
+    assert window.classification_manager.class_counts == (2, 2)
+    assert class_a[0].is_file()
+
+    window.delete_current()
+    assert window.images == [class_a[2]]
+    assert window.classification_manager.class_counts == (1, 2)
+    assert class_a[1].is_file()
+    assert class_b.is_file()
+
+    window.undo_latest()
+    assert window.images == class_a[1:]
+    assert window.current_path == class_a[1]
+    assert window.classification_manager.class_counts == (2, 2)
+    window.undo_latest()
+    assert window.images == class_a
+    assert window.current_path == class_a[0]
+    assert window.classification_manager.class_counts == (3, 1)
+    assert not window.classification_manager.has_unexported_changes
+    assert not window.simple_publish_button.isEnabled()
+    assert _snapshot_files(root) == before

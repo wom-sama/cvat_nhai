@@ -5,14 +5,16 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 class OperationJournal:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, create_parent: bool = True) -> None:
         self.path = path
         self._lock = threading.Lock()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if create_parent:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def append(self, payload: Dict[str, Any]) -> None:
         line = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
                 handle.flush()

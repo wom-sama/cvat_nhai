@@ -216,6 +216,32 @@ di chon bang click. Bo loc class, thanh keo tien do, zoom/pan va nhan giu
 - `Delete`: loai anh khoi thu muc `data`.
 - `Ctrl+Z`: bo thay doi chua luu, hoac phuc hoi lan di chuyen/xoa gan nhat.
 
+### Luu thanh dataset moi, khong sua dataset nguon
+
+Nut `Sua truc tiep dataset goc` trong muc `CHE DO LUU` co the bat thanh
+`Luu thanh dataset moi`. Khi bat, tool yeu cau chon mot thu muc cha va de xuat
+ten `<ten_data>_edited`; duong dan day du van co the sua tay neu can.
+
+- `Enter` chi xep doi class trong bo nho va chuyen sang anh tiep theo.
+- `Delete` chi danh dau anh se bi loai khoi ban dataset moi.
+- `Ctrl+Z` hoan tac cac thao tac staging theo thu tu LIFO.
+- Bo dem class, bo loc class va danh sach anh cap nhat theo trang thai staging,
+  nhung moi file trong dataset nguon van giu nguyen duong dan va noi dung.
+- Nut `XAC NHAN Tao dataset moi` moi thuc su sao chep anh sang dich. Dialog tien
+  do cho biet anh dang xu ly va cho phep `Huy an toan`.
+
+Thu muc dich phai chua ton tai hoac dang rong, nam ngoai dataset nguon. Tool
+tao tat ca thu muc class, giu duong dan long khi co the va them hau to
+`__classeditNNN` neu hai anh roi vao cung duong dan. Ket qua duoc dung trong
+thu muc tam cung volume va chi publish bang atomic rename sau khi sao chep
+thanh cong toan bo. Loi doc/ghi, file nguon bi thay doi, dich xuat hien giua
+chung hoac huy thao tac deu xoa ban tam; dataset nguon va noi dung co san tai
+dich khong bi ghi de.
+
+Neu con staging chua xuat, tool hoi xac nhan truoc khi tat che do, doi mode,
+mo dataset khac hay dong ung dung. Sau khi xuat, duong dan dich duoc xoa khoi
+o nhap de lan xuat tiep theo khong vo tinh ghi vao bo vua tao.
+
 Mode nay khong tao hay sua `data.yaml`, `manifest.csv`, split hoac bbox. Anh
 bi `Delete` duoc dua ra archive nam canh dataset:
 
