@@ -5,6 +5,7 @@ from PIL import Image
 from PySide6.QtCore import Qt
 
 import cvat_nhai.main_window as main_window_module
+from cvat_nhai.constants import CLASS_NAMES
 from cvat_nhai.main_window import MainWindow
 
 
@@ -269,3 +270,262 @@ def test_simple_mode_reports_invalid_root_without_freezing_ui(
     assert window.scan_button.isEnabled()
     assert window.scan_button.text() == "Mo data don gian"
     assert not window.busy
+
+
+def test_simple_filter_move_delete_to_empty_seek_guard_and_undo(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    class_a = [
+        _image(root / "a" / f"a{index}.png", "green")
+        for index in range(3)
+    ]
+    for index in range(2):
+        _image(root / "b" / f"b{index}.png", "orange")
+    _image(root / "c" / "c0.png", "red")
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    _open_simple_mode(window, root)
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == class_a[0]
+            and not window.active_tasks
+            and not window.canvas.is_loading
+        ),
+        timeout=5000,
+    )
+    window.editor_class_filter_combo.setCurrentIndex(
+        window.editor_class_filter_combo.findData(0)
+    )
+    assert window.images == class_a
+
+    window.seek_to_index(2)
+    assert window.current_path == class_a[2]
+    window.select_class(1)
+    assert window._classification_is_dirty()
+    window.seek_to_index(0)
+    assert window.current_path == class_a[2]
+    assert window.progress.value() == 2
+    window.reset_annotation()
+    window.seek_to_index(0)
+    assert window.current_path == class_a[0]
+
+    window.select_class(1)
+    window.commit_current()
+    moved = root / "b" / "a0.png"
+    qtbot.waitUntil(
+        lambda: (
+            moved.is_file()
+            and window.current_path == class_a[1]
+            and len(window.images) == 2
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert window.classification_manager.class_counts == (2, 3, 1)
+
+    window.delete_current()
+    qtbot.waitUntil(
+        lambda: (
+            not class_a[1].exists()
+            and window.current_path == class_a[2]
+            and len(window.images) == 1
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    window.delete_current()
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path is None
+            and not window.images
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert "0 anh class 1 (a)" in window.queue_label.text()
+    assert window.classification_manager.class_counts == (0, 3, 1)
+
+    window.undo_latest()
+    qtbot.waitUntil(
+        lambda: (
+            class_a[2].is_file()
+            and window.current_path == class_a[2]
+            and window.images == [class_a[2]]
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert window.classification_manager.class_counts == (1, 3, 1)
+
+
+def test_simple_mode_switch_restores_legacy_buttons_and_saved_root(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "many_classes"
+    for index in range(12):
+        (root / f"class_{index:02d}").mkdir(parents=True)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    _open_simple_mode(window, root)
+    qtbot.waitUntil(lambda: not window.active_tasks, timeout=5000)
+    assert len(window.class_buttons) == 12
+    assert all(button.isVisible() for button in window.class_buttons)
+
+    window.mode_combo.setCurrentIndex(window.mode_combo.findData("label"))
+    assert window.active_class_names == CLASS_NAMES
+    assert all(button.isVisible() for button in window.class_buttons[:5])
+    assert all(button.isHidden() for button in window.class_buttons[5:])
+    assert window.canvas._annotation_enabled
+    assert window.editor_class_filter_combo.isHidden()
+
+    window.mode_combo.setCurrentIndex(
+        window.mode_combo.findData("simple_class")
+    )
+    assert window.source_edit.text() == str(root.resolve())
+    assert window.active_class_names == ()
+    assert all(button.isHidden() for button in window.class_buttons)
+    assert not window.canvas._annotation_enabled
+
+
+def test_corrupt_image_can_be_skipped_deleted_and_restored(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    corrupt = root / "a" / "00_corrupt.jpg"
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_bytes(b"not-a-real-image")
+    good = _image(root / "a" / "01_good.png", "green")
+    errors = []
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    monkeypatch.setattr(window, "_show_error", errors.append)
+    _open_simple_mode(window, root)
+    qtbot.waitUntil(
+        lambda: bool(errors) and not window.active_tasks,
+        timeout=5000,
+    )
+
+    assert window.current_path == corrupt
+    assert window.navigate(1)
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == good
+            and not window.canvas._image.isNull()
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    assert window.navigate(-1)
+    qtbot.waitUntil(
+        lambda: len(errors) >= 2 and not window.active_tasks,
+        timeout=5000,
+    )
+    window.delete_current()
+    qtbot.waitUntil(
+        lambda: (
+            not corrupt.exists()
+            and corrupt not in window.classification_samples_by_path
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    window.undo_latest()
+    qtbot.waitUntil(
+        lambda: (
+            corrupt.exists()
+            and corrupt.read_bytes() == b"not-a-real-image"
+            and corrupt in window.classification_samples_by_path
+            and len(errors) >= 3
+            and not window.active_tasks
+        ),
+        timeout=5000,
+    )
+    qtbot.wait(50)
+
+
+def test_close_during_slow_image_failure_ignores_late_callback(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "data"
+    _image(root / "a" / "one.png", "green")
+    errors = []
+
+    def slow_failure(path):
+        time.sleep(0.25)
+        raise RuntimeError("late decoder failure")
+
+    monkeypatch.setattr(main_window_module, "load_qimage", slow_failure)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    monkeypatch.setattr(window, "_show_error", errors.append)
+    _open_simple_mode(window, root)
+    qtbot.waitUntil(
+        lambda: (
+            window.classification_index is not None
+            and not window.busy
+            and bool(window.active_tasks)
+        ),
+        timeout=5000,
+    )
+
+    assert window.close()
+    assert window.closing
+    qtbot.waitUntil(lambda: not window.active_tasks, timeout=5000)
+    qtbot.wait(50)
+    assert errors == []
+
+
+def test_failed_rescan_preserves_open_dataset_and_controls(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    valid_root = tmp_path / "valid"
+    valid_image = _image(valid_root / "a" / "one.png", "green")
+    invalid_root = tmp_path / "invalid"
+    _image(invalid_root / "orphan.png", "red")
+    errors = []
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    monkeypatch.setattr(window, "_show_error", errors.append)
+    _open_simple_mode(window, valid_root)
+    qtbot.waitUntil(
+        lambda: (
+            window.current_path == valid_image
+            and not window.active_tasks
+            and not window.canvas.is_loading
+        ),
+        timeout=5000,
+    )
+    original_manager = window.classification_manager
+    original_images = list(window.images)
+
+    window.source_edit.setText(str(invalid_root))
+    window.scan_source()
+    qtbot.waitUntil(
+        lambda: bool(errors) and not window.active_tasks,
+        timeout=5000,
+    )
+
+    assert window.classification_manager is original_manager
+    assert window.images == original_images
+    assert window.current_path == valid_image
+    assert valid_image.is_file()
+    assert window.scan_button.isEnabled()
+    assert window.mode_combo.isEnabled()

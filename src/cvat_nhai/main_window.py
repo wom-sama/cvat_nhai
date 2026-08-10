@@ -167,6 +167,7 @@ class MainWindow(QMainWindow):
         self.current_path: Optional[Path] = None
         self.selected_class = -1
         self.busy = False
+        self.closing = False
         self.image_cache: "OrderedDict[str, QImage]" = OrderedDict()
         self.pending_loads = set()
         self.active_tasks = set()
@@ -1323,6 +1324,8 @@ class MainWindow(QMainWindow):
         self._start_task(task)
 
     def _image_loaded(self, path: Path, result: object) -> None:
+        if self.closing:
+            return
         image = result
         if not isinstance(image, QImage):
             return
@@ -1347,6 +1350,8 @@ class MainWindow(QMainWindow):
         path: Path,
         traceback_text: str,
     ) -> None:
+        if self.closing:
+            return
         if self.current_path == path:
             self.canvas.clear_loading()
         self._background_failed(traceback_text)
@@ -2844,6 +2849,8 @@ class MainWindow(QMainWindow):
         self._update_schema_status()
 
     def _background_failed(self, traceback_text: str) -> None:
+        if self.closing:
+            return
         lines = traceback_text.strip().splitlines()
         message = lines[-1] if lines else "Loi khong xac dinh"
         self._show_error(message)
@@ -2868,6 +2875,7 @@ class MainWindow(QMainWindow):
         if self.export_destination_dialog is not None:
             self.export_destination_dialog.close()
             self.export_destination_dialog = None
+        self.closing = True
         self._stop_continuous_navigation()
         self.settings.sync()
         super().closeEvent(event)

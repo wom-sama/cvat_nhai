@@ -249,7 +249,7 @@ class SimpleClassificationEditor:
                 self.class_dirs[sample.class_id]
             )
             requested_target = self.class_dirs[class_id] / relative
-            requested_target.parent.mkdir(parents=True, exist_ok=True)
+            self._prepare_class_parent(requested_target.parent, class_id)
             target = self._unique_target(requested_target)
             sample.image_path.replace(target)
             counts_changed = False
@@ -364,7 +364,7 @@ class SimpleClassificationEditor:
         self._validate_data_path(old_path, old_class_id)
         self._validate_undo_paths(new_path, old_path)
 
-        old_path.parent.mkdir(parents=True, exist_ok=True)
+        self._prepare_class_parent(old_path.parent, old_class_id)
         new_path.replace(old_path)
         counts_changed = False
         try:
@@ -402,7 +402,7 @@ class SimpleClassificationEditor:
             )
         self._validate_undo_paths(archive_path, image_path)
 
-        image_path.parent.mkdir(parents=True, exist_ok=True)
+        self._prepare_class_parent(image_path.parent, class_id)
         shutil.move(str(archive_path), str(image_path))
         count_changed = False
         try:
@@ -461,6 +461,46 @@ class SimpleClassificationEditor:
             raise SimpleClassificationError(
                 "Thu muc class da bi doi/xoa ben ngoai; hay mo lai dataset: "
                 "{}".format(path)
+            )
+
+    def _prepare_class_parent(self, parent: Path, class_id: int) -> None:
+        self._validate_class_directory(class_id)
+        class_dir = self.class_dirs[class_id]
+        try:
+            relative = parent.relative_to(class_dir)
+        except ValueError as error:
+            raise SimpleClassificationError(
+                "Thu muc dich nam ngoai class du kien: {}".format(parent)
+            ) from error
+
+        current = class_dir
+        for part in relative.parts:
+            current = current / part
+            if _is_reparse_point(current):
+                raise SimpleClassificationError(
+                    "Khong ho tro symlink/junction trong class dich: {}".format(
+                        current
+                    )
+                )
+            if current.exists():
+                if not current.is_dir():
+                    raise SimpleClassificationError(
+                        "Thanh phan duong dan dich khong phai thu muc: {}".format(
+                            current
+                        )
+                    )
+                continue
+            current.mkdir()
+            if _is_reparse_point(current):
+                raise SimpleClassificationError(
+                    "Thu muc dich vua tao bi thay bang symlink/junction: {}".format(
+                        current
+                    )
+                )
+
+        if not _is_relative_to(_resolve(current), class_dir):
+            raise SimpleClassificationError(
+                "Thu muc dich nam ngoai class du kien: {}".format(current)
             )
 
     def _validate_data_path(self, path: Path, class_id: int) -> None:
